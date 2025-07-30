@@ -23,8 +23,10 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { defineComponent, nextTick, Ref, ref } from 'vue';
+import { defineComponent, nextTick, provide, Ref, ref } from 'vue';
+
 import useIntersectionObserver from '@/hooks/use-intersection-observer';
+
 import './row-render.scss';
 
 export default defineComponent({
@@ -38,22 +40,29 @@ export default defineComponent({
   setup(props, { slots, emit }) {
     const refRootContainer: Ref<HTMLElement> = ref();
     const refRowNodeRoot: Ref<HTMLElement> = ref();
+    const isRowIntersecting = ref(false);
+    provide('isRowIntersecting', isRowIntersecting);
 
     const { destroyObserver } = useIntersectionObserver(
       () => refRootContainer.value,
       entry => {
         if (entry.isIntersecting) {
-          emit('row-visible', entry.isIntersecting);
+          isRowIntersecting.value = true;
           nextTick(destroyObserver);
         }
       },
     );
+
+    const handleRowClick = (e: MouseEvent) => {
+      emit('row-click', e);
+    };
 
     const renderRowVNode = () => {
       return (
         <div
           ref={refRootContainer}
           data-row-index={props.rowIndex}
+          on-click={handleRowClick}
         >
           <div
             ref={refRowNodeRoot}

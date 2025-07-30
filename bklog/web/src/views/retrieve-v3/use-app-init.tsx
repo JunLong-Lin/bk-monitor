@@ -81,18 +81,26 @@ export default () => {
 
   RetrieveHelper.setScrollSelector('.v3-bklog-content');
 
-  RetrieveHelper.on(RetrieveEvent.SEARCHBAR_HEIGHT_CHANGE, height => {
+  const handleSearchBarHeightChange = height => {
     searchBarHeight.value = height;
-  })
-    .on(RetrieveEvent.FAVORITE_WIDTH_CHANGE, width => {
-      favoriteWidth.value = width;
-    })
-    .on(RetrieveEvent.FAVORITE_SHOWN_CHANGE, isShown => {
-      isFavoriteShown.value = isShown;
-    })
-    .on(RetrieveEvent.TREND_GRAPH_HEIGHT_CHANGE, height => {
-      trendGraphHeight.value = height;
-    });
+  };
+
+  const handleFavoriteWidthChange = width => {
+    favoriteWidth.value = width;
+  };
+
+  const hanldeFavoriteShown = isShown => {
+    isFavoriteShown.value = isShown;
+  };
+
+  const handleGraphHeightChange = height => {
+    trendGraphHeight.value = height;
+  };
+
+  RetrieveHelper.on(RetrieveEvent.SEARCHBAR_HEIGHT_CHANGE, handleSearchBarHeightChange)
+    .on(RetrieveEvent.FAVORITE_WIDTH_CHANGE, handleFavoriteWidthChange)
+    .on(RetrieveEvent.FAVORITE_SHOWN_CHANGE, hanldeFavoriteShown)
+    .on(RetrieveEvent.TREND_GRAPH_HEIGHT_CHANGE, handleGraphHeightChange);
 
   const spaceUid = computed(() => store.state.spaceUid);
   const bkBizId = computed(() => store.state.bkBizId);
@@ -175,10 +183,31 @@ export default () => {
    * 拉取索引集列表
    */
   const getIndexSetList = () => {
+    store.commit('updateIndexSetQueryResult', {
+      origin_log_list: [],
+      list: [],
+      exception_msg: '',
+      is_error: false,
+    });
+
     return store
       .dispatch('retrieve/getIndexSetList', { spaceUid: spaceUid.value, bkBizId: bkBizId.value, is_group: true })
       .then(resp => {
         isPreApiLoaded.value = true;
+
+        // 在路由不带indexId的情况下 检查 unionList 和 tags 参数 是否存在联合查询索引集参数
+        // tags 是 BCS索引集注入内置标签特殊检索
+        if (!indexSetIdList.value.length && route.query.tags?.length) {
+          const tagList = Array.isArray(route.query.tags) ? route.query.tags : route.query.tags.split(',');
+          const indexSetMatch = resp[1]
+            .filter(item => item.tags.some(tag => tagList.includes(tag.name)))
+            .map(val => val.index_set_id);
+          if (indexSetMatch.length) {
+            store.commit('updateIndexItem', { ids: indexSetMatch, isUnionIndex: true, selectIsUnionSearch: true });
+            store.commit('updateUnionIndexItemList', tagList);
+            store.commit('updateStorage', { [BK_LOG_STORAGE.INDEX_SET_ACTIVE_TAB]: 'union' });
+          }
+        }
 
         // 如果当前地址参数没有indexSetId，则默认取第一个索引集
         // 同时，更新索引信息到store中

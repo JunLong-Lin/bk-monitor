@@ -19,12 +19,19 @@ We undertake not to change the open source license (MIT license) applicable to t
 the project delivered to anyone in the future.
 """
 
+from django.conf.urls import include
+from django.urls import re_path
+from rest_framework import routers
 
-# from apps.tgpa.views import TgpaViewSet
+from apps.tgpa.views import TGPATaskViewSet, TGPAReportViewSet, TGPAViewSet
 
-# router = routers.DefaultRouter(trailing_slash=True)
-# router.register(r"", TgpaViewSet, basename="tgpa")
+
+router = routers.DefaultRouter(trailing_slash=True)
+
+router.register(r"", TGPAViewSet, basename="tgpa")
+router.register(r"task", TGPATaskViewSet, basename="task")
+router.register(r"report", TGPAReportViewSet, basename="report")
 
 urlpatterns = [
-    # re_path(r"^tgpa/", include(router.urls)),
+    re_path(r"^tgpa/", include(router.urls)),
 ]

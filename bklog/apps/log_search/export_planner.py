@@ -1,0 +1,199 @@
+"""Bounded adaptive partitioning, with state and query I/O kept at the edges."""
+
+import time
+from dataclasses import replace
+
+from django.utils import timezone
+
+from apps.log_search import export_state as state
+from apps.log_search.export_contracts import (
+    PlannerPolicy,
+    PlanningError,
+    PartSpec,
+    PartLimitExceededError,
+    PlanValidationError,
+    StaleExportUpdateError,
+    nonnegative_integer,
+)
+from apps.log_search.export_query import Statistics, StatisticsFactory
+from apps.utils.log import logger
+
+
+class AdaptivePlanner:
+    def __init__(
+        self, job, statistics: Statistics, policy: PlannerPolicy, *, heartbeat=lambda: None, clock=None, started_at=None
+    ):
+        self.job, self.statistics, self.policy = job, statistics, policy
+        self.heartbeat, self.clock = heartbeat, clock or time.monotonic
+        self.deadline = (self.clock() if started_at is None else started_at) + policy.deadline_seconds
+        self.calls = 0
+        self.tick = job.time_tick
+        units = job.query_snapshot["time_units_per_second"]
+        if type(self.tick) is not int or self.tick < 1 or type(units) is not int or units < 1:
+            raise PlanningError("INVALID_TIME_PRECISION")
+        self.interval = ((30 * units + self.tick - 1) // self.tick) * self.tick
+        self.average_bytes = policy.fallback_row_bytes
+
+    def call(self, method, *args):
+        ownership_remaining = self.heartbeat()
+        remaining = self.deadline - self.clock()
+        if ownership_remaining is not None:
+            remaining = min(remaining, ownership_remaining)
+        if remaining <= 0 or self.calls >= self.policy.max_calls:
+            raise PlanningError("PLANNING_BUDGET_EXCEEDED")
+        self.calls += 1
+        result = method(*args, timeout=min(remaining, self.policy.request_timeout))
+        if self.clock() >= self.deadline:
+            raise PlanningError("PLANNING_BUDGET_EXCEEDED")
+        self.heartbeat()
+        return result
+
+    def fits(self, rows):
+        return rows <= self.policy.target_rows and rows * self.average_bytes <= self.policy.target_bytes
+
+    def refine(self, start, end, rows):
+        pending = [(start, end, rows)]
+        while pending:
+            start, end, rows = pending.pop()
+            if self.fits(rows) or end - start == self.tick:
+                yield PartSpec(None, start, end, rows, rows * self.average_bytes, not self.fits(rows))
+                continue
+            midpoint = start + ((end - start) // self.tick // 2) * self.tick
+            left = nonnegative_integer(self.call(self.statistics.count, start, midpoint))
+            right = nonnegative_integer(self.call(self.statistics.count, midpoint, end))
+            pending.extend([(midpoint, end, right), (start, midpoint, left)])
+
+    def range_parts(self, start, end):
+        cursor = start
+        while cursor < end:
+            first_bucket = cursor // self.interval * self.interval
+            stop = min(end, first_bucket + self.interval * self.policy.max_buckets)
+            buckets = self.call(self.statistics.histogram, cursor, stop, self.interval)
+            if not isinstance(buckets, dict) or len(buckets) > self.policy.max_buckets:
+                raise PlanningError("INVALID_STATISTICS")
+            for key, count in buckets.items():
+                if type(key) is not int or key % self.interval or not first_bucket <= key < stop:
+                    raise PlanningError("INVALID_STATISTICS")
+                nonnegative_integer(count)
+            for bucket in range(first_bucket, stop, self.interval):
+                yield from self.refine(max(cursor, bucket), min(stop, bucket + self.interval), buckets.get(bucket, 0))
+            cursor = stop
+
+    def build(self, *, start=None, end=None, force_split=False):
+        start = self.job.start_time if start is None else start
+        end = self.job.end_time if end is None else end
+        if (
+            any(type(value) is not int or value % self.tick for value in (start, end))
+            or not self.job.start_time <= start < end <= self.job.end_time
+        ):
+            raise PlanningError("INVALID_TIME_PRECISION")
+        ranges = [(start, end)]
+        if force_split:
+            if end - start <= self.tick:
+                raise PlanningError("OVERSIZED_UNSPLITTABLE")
+            middle = start + ((end - start) // self.tick // 2) * self.tick
+            ranges = [(start, middle), (middle, end)]
+        total = nonnegative_integer(self.call(self.statistics.count, start, end))
+        if not force_split and total > self.policy.max_rows:
+            raise PlanningError("QUOTA_EXCEEDED")
+        sample = self.call(self.statistics.sample, start, end, self.policy.sample_rows) if total else []
+        if not isinstance(sample, list) or any(not isinstance(row, bytes) for row in sample):
+            raise PlanningError("INVALID_STATISTICS")
+        size = sum(map(len, sample))
+        if len(sample) > self.policy.sample_rows or size > self.policy.sample_bytes:
+            raise PlanningError("SAMPLE_BUDGET_EXCEEDED")
+        if sample:
+            self.average_bytes = max(1, (size + len(sample) - 1) // len(sample))
+
+        parts = []
+        for lower, upper in ranges:
+            # A forced split preserves one boundary, while both children still
+            # use the ordinary adaptive refinement and merge algorithm.
+            pieces = self.range_parts(lower, upper) if total else [PartSpec(None, lower, upper, 0, 0)]
+            for part in pieces:
+                previous = parts[-1] if parts and parts[-1].end_time > lower else None
+                if (
+                    previous
+                    and not previous.oversized
+                    and not part.oversized
+                    and self.fits(previous.estimated_rows + part.estimated_rows)
+                ):
+                    parts[-1] = replace(
+                        previous,
+                        end_time=part.end_time,
+                        estimated_rows=previous.estimated_rows + part.estimated_rows,
+                        estimated_bytes=previous.estimated_bytes + part.estimated_bytes,
+                    )
+                else:
+                    parts.append(part)
+                    if len(parts) > self.policy.max_parts:
+                        raise PlanningError("PART_LIMIT_EXCEEDED")
+        estimate = max(total, sum(part.estimated_rows for part in parts))
+        if not force_split and estimate > self.policy.max_rows:
+            raise PlanningError("QUOTA_EXCEEDED")
+        if self.clock() >= self.deadline:
+            raise PlanningError("PLANNING_BUDGET_EXCEEDED")
+        self.heartbeat()
+        return [replace(part, part_no=i + 1) for i, part in enumerate(parts)], estimate
+
+
+def _run_planning(attempt: state.PlanningAttempt | None, statistics_factory: StatisticsFactory):
+    if attempt is None:
+        return None
+    try:
+        policy = PlannerPolicy.for_job(attempt.job)
+        # The factory owns tenant/user context and must restore it on success,
+        # failure, cancellation and a stale planning callback alike.
+        attempt.heartbeat()
+        started_at = time.monotonic()
+        with statistics_factory(attempt.job) as statistics:
+            planner = AdaptivePlanner(
+                attempt.job, statistics, policy, heartbeat=attempt.heartbeat, started_at=started_at
+            )
+            target = attempt.part or attempt.job
+            parts, estimate = planner.build(
+                start=target.start_time, end=target.end_time, force_split=attempt.part is not None
+            )
+        if attempt.part is not None:
+            return state.split_part(
+                attempt.part.pk,
+                children=[replace(part, part_no=None) for part in parts],
+                max_leaf_parts=policy.max_parts,
+                attempt=attempt,
+            )
+        return state.persist_plan(
+            attempt.job.pk,
+            query_hash=attempt.job.query_hash,
+            target_rows=policy.target_rows,
+            target_bytes=policy.target_bytes,
+            histogram_interval=planner.interval,
+            parts=parts,
+            statistics_at=timezone.now(),
+            planning_input={"policy": vars(policy), "calls": planner.calls},
+            max_leaf_parts=policy.max_parts,
+            estimated_total=estimate,
+            attempt=attempt,
+        )
+    except StaleExportUpdateError:
+        return None
+    except Exception as exc:
+        if isinstance(exc, PlanningError):
+            error = exc
+        elif isinstance(exc, PartLimitExceededError):
+            error = PlanningError("PART_LIMIT_EXCEEDED")
+        elif isinstance(exc, PlanValidationError):
+            error = PlanningError("INVALID_PLAN")
+        else:
+            # Do not persist/log query contents or credentials from exceptions.
+            logger.warning("export planning job=%s exception_type=%s", attempt.job.pk, type(exc).__name__)
+            error = PlanningError("STATISTICS_FAILED", retryable=True)
+        attempt.fail(error)
+        return None
+
+
+def plan_job(job_id: int, statistics_factory: StatisticsFactory):
+    return _run_planning(state.claim_planning(job_id=job_id), statistics_factory)
+
+
+def replan_failed_part(part_id: int, statistics_factory: StatisticsFactory):
+    return _run_planning(state.claim_planning(part_id=part_id), statistics_factory)

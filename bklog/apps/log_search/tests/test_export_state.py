@@ -1,0 +1,524 @@
+from datetime import timedelta
+from unittest.mock import patch
+
+from django.test import TestCase, override_settings
+from django.utils import timezone
+
+from apps.log_search.export_models import ExportJob, ExportPart
+from apps.log_search.export_state import (
+    ExportStateError,
+    InvalidTransitionError,
+    PartSpec,
+    PlanValidationError,
+    StaleExportUpdateError,
+    begin_planning,
+    begin_part_upload,
+    cancel_job,
+    claim_part,
+    claim_planning,
+    complete_part,
+    dispatch_part,
+    fail_job,
+    finalize_job_success,
+    heartbeat_part,
+    mark_part_published,
+    persist_plan,
+    release_dispatch,
+    replay_dispatched_part,
+    retry_part,
+    split_part,
+)
+
+
+class ExportStateTest(TestCase):
+    def create_job(self, *, end_time=20):
+        return ExportJob.objects.create(
+            bk_tenant_id="tenant-a",
+            space_uid="space-a",
+            created_by="alice",
+            source_app_code="bk_log_search",
+            request_id="request-1",
+            query_kind=ExportJob.QueryKind.SINGLE,
+            index_set_ids=[1],
+            query_snapshot={"time_field": "dtEventTimeStamp"},
+            query_hash="a" * 64,
+            start_time=0,
+            end_time=end_time,
+            time_tick=1,
+        )
+
+    def activate_plan(self, job, *, parts=None):
+        begin_planning(job.pk)
+        return persist_plan(
+            job.pk,
+            attempt=claim_planning(job_id=job.pk),
+            query_hash=job.query_hash,
+            target_rows=30_000,
+            target_bytes=64 * 1024 * 1024,
+            histogram_interval=30_000,
+            parts=parts or [PartSpec(1, job.start_time, job.end_time, estimated_rows=10)],
+        )
+
+    def dispatch_and_claim(self, part, *, generation=None):
+        lease_id = f"lease-{part.pk}"
+        dispatched = dispatch_part(
+            part.pk,
+            lease_id=lease_id,
+            task_id=f"task-{part.pk}",
+            lease_until=timezone.now() + timedelta(minutes=5),
+        )
+        generation = generation or dispatched.dispatch_generation
+        mark_part_published(part.pk, generation=generation)
+        claimed = claim_part(part.pk, generation=generation, lease_id=lease_id, worker_id="worker-1")
+        return claimed, lease_id, generation
+
+    def complete_claimed_part(self, part, lease_id, generation, *, rows=10):
+        begin_part_upload(part.pk, generation=generation, lease_id=lease_id)
+        return complete_part(
+            part.pk,
+            generation=generation,
+            lease_id=lease_id,
+            actual_rows=rows,
+            actual_bytes=100,
+            compressed_bytes=50,
+            object_key=f"exports/{part.pk}.tar.gz",
+            checksum="b" * 64,
+        )
+
+    def test_plan_activation_requires_exact_cover_and_is_atomic(self):
+        job = self.create_job()
+        begin_planning(job.pk)
+
+        with self.assertRaises(PlanValidationError):
+            persist_plan(
+                job.pk,
+                attempt=claim_planning(job_id=job.pk),
+                query_hash=job.query_hash,
+                target_rows=1,
+                target_bytes=1,
+                histogram_interval=1,
+                parts=[PartSpec(1, 0, 5), PartSpec(2, 6, 20)],
+            )
+
+        self.assertFalse(job.plans.exists())
+        self.assertEqual(ExportPart.objects.count(), 0)
+        job.refresh_from_db()
+        self.assertEqual(job.status, ExportJob.Status.PLANNING)
+
+    def test_part_lifecycle_uses_generation_and_recomputes_actual_total(self):
+        job = self.create_job()
+        plan = self.activate_plan(job)
+        part = plan.parts.get()
+        claimed, lease_id, generation = self.dispatch_and_claim(part)
+
+        self.assertEqual(claimed.attempts, 1)
+        heartbeat_part(
+            part.pk,
+            generation=generation,
+            lease_id=lease_id,
+            lease_until=timezone.now() + timedelta(minutes=5),
+            processed_rows=4,
+        )
+        self.complete_claimed_part(part, lease_id, generation, rows=10)
+
+        part.refresh_from_db()
+        job.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.SUCCESS)
+        self.assertEqual(part.processed_rows, 10)
+        self.assertEqual(job.actual_total, 10)
+        with self.assertRaises(StaleExportUpdateError):
+            heartbeat_part(
+                part.pk,
+                generation=generation,
+                lease_id=lease_id,
+                lease_until=timezone.now() + timedelta(minutes=5),
+            )
+
+    def test_dispatch_failure_releases_without_consuming_attempt_and_uncertain_publish_replays_same_generation(self):
+        job = self.create_job()
+        plan = self.activate_plan(job)
+        part = plan.parts.get()
+        lease_id = "lease-dispatch"
+        dispatched = dispatch_part(
+            part.pk,
+            lease_id=lease_id,
+            task_id="task-dispatch",
+            lease_until=timezone.now() + timedelta(minutes=5),
+        )
+        replayed = replay_dispatched_part(
+            part.pk,
+            generation=dispatched.dispatch_generation,
+            lease_id=lease_id,
+        )
+        self.assertEqual(replayed.dispatch_generation, 1)
+        release_dispatch(part.pk, generation=1, lease_id=lease_id)
+        part.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.WAITING)
+        self.assertEqual(part.attempts, 0)
+
+        dispatched = dispatch_part(
+            part.pk,
+            lease_id="lease-next",
+            task_id="task-next",
+            lease_until=timezone.now() + timedelta(minutes=5),
+        )
+        self.assertEqual(dispatched.dispatch_generation, 2)
+
+    def test_retry_is_bounded_to_three_attempts(self):
+        job = self.create_job()
+        plan = self.activate_plan(job)
+        part = plan.parts.get()
+
+        for attempt in range(1, 4):
+            claimed, lease_id, generation = self.dispatch_and_claim(part)
+            retry_part(
+                part.pk,
+                generation=generation,
+                lease_id=lease_id,
+                error_code="QUERY_FAILED",
+                error_detail="transient",
+            )
+            part.refresh_from_db()
+            expected = ExportPart.Status.WAITING if attempt < 3 else ExportPart.Status.FAILED
+            self.assertEqual(part.status, expected)
+            self.assertEqual(claimed.attempts, attempt)
+
+    @override_settings(ASYNC_EXPORT_MAX_ATTEMPTS=1)
+    def test_failed_leaf_can_be_replaced_by_contiguous_children(self):
+        job = self.create_job()
+        plan = self.activate_plan(job)
+        part = plan.parts.get()
+        _claimed, lease_id, generation = self.dispatch_and_claim(part)
+        retry_part(
+            part.pk,
+            generation=generation,
+            lease_id=lease_id,
+            error_code="OVERSIZED",
+            error_detail="cannot finish in one attempt",
+        )
+
+        children = split_part(
+            part.pk,
+            attempt=claim_planning(part_id=part.pk),
+            children=[PartSpec(None, 0, 10), PartSpec(None, 10, 20)],
+        )
+
+        part.refresh_from_db()
+        plan.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.SPLIT)
+        self.assertFalse(part.is_leaf)
+        self.assertEqual(len(children), 2)
+        self.assertEqual(plan.part_count, 2)
+        self.assertEqual(set(plan.parts.filter(is_leaf=True).values_list("part_no", flat=True)), {2, 3})
+
+    def test_cancel_keeps_running_io_uncancelled_but_blocks_result(self):
+        job = self.create_job()
+        plan = self.activate_plan(
+            job,
+            parts=[PartSpec(1, 0, 10), PartSpec(2, 10, 20)],
+        )
+        running, lease_id, generation = self.dispatch_and_claim(plan.parts.get(part_no=1))
+        cancel_job(job.pk)
+
+        running.refresh_from_db()
+        waiting = plan.parts.get(part_no=2)
+        self.assertEqual(running.status, ExportPart.Status.RUNNING)
+        self.assertEqual(waiting.status, ExportPart.Status.CANCELED)
+        with self.assertRaises(StaleExportUpdateError):
+            self.complete_claimed_part(running, lease_id, generation)
+
+    def test_manifest_success_requires_all_current_leaf_parts(self):
+        job = self.create_job()
+        plan = self.activate_plan(
+            job,
+            parts=[PartSpec(1, 0, 10), PartSpec(2, 10, 20)],
+        )
+        first = plan.parts.get(part_no=1)
+        claimed, lease_id, generation = self.dispatch_and_claim(first)
+        self.complete_claimed_part(claimed, lease_id, generation)
+
+        with self.assertRaises(InvalidTransitionError):
+            finalize_job_success(
+                job.pk,
+                plan_version=plan.plan_version,
+                manifest_object_key="exports/manifest.json",
+                manifest_checksum="c" * 64,
+            )
+
+        second = plan.parts.get(part_no=2)
+        claimed, lease_id, generation = self.dispatch_and_claim(second)
+        self.complete_claimed_part(claimed, lease_id, generation, rows=20)
+        finalized = finalize_job_success(
+            job.pk,
+            plan_version=plan.plan_version,
+            manifest_object_key="exports/manifest.json",
+            manifest_checksum="c" * 64,
+        )
+        self.assertEqual(finalized.status, ExportJob.Status.SUCCESS)
+        self.assertEqual(finalized.actual_total, 30)
+
+    def test_repeated_planning_transition_is_rejected(self):
+        job = self.create_job()
+        begin_planning(job.pk)
+        with self.assertRaises(InvalidTransitionError):
+            begin_planning(job.pk)
+
+    def test_planning_failure_is_terminal_and_does_not_leave_dispatchable_parts(self):
+        job = self.create_job()
+        begin_planning(job.pk)
+        failed = fail_job(job.pk, error_code="STATISTICS_FAILED", error_detail="unify query unavailable")
+        self.assertEqual(failed.status, ExportJob.Status.FAILED)
+        self.assertEqual(failed.error_code, "STATISTICS_FAILED")
+
+    def test_expired_dispatch_cannot_be_created_claimed_or_replayed(self):
+        job = self.create_job()
+        part = self.activate_plan(job).parts.get()
+        now = timezone.now()
+        with patch("apps.log_search.export_state._now", return_value=now):
+            with self.assertRaises(ExportStateError):
+                dispatch_part(part.pk, lease_id="lease", task_id="task", lease_until=now)
+        part.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.WAITING)
+        self.assertEqual(part.dispatch_generation, 0)
+        dispatched = dispatch_part(part.pk, lease_id="lease", task_id="task", lease_until=now + timedelta(minutes=1))
+        with patch("apps.log_search.export_state._now", return_value=dispatched.lease_until):
+            with self.assertRaises(StaleExportUpdateError):
+                claim_part(part.pk, generation=1, lease_id="lease", worker_id="worker")
+            with self.assertRaises(StaleExportUpdateError):
+                replay_dispatched_part(part.pk, generation=1, lease_id="lease")
+        part.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.DISPATCHED)
+        self.assertEqual(part.attempts, 0)
+
+    def test_expired_worker_cannot_revive_lease_upload_or_commit(self):
+        job = self.create_job()
+        part, lease_id, generation = self.dispatch_and_claim(self.activate_plan(job).parts.get())
+        with patch("apps.log_search.export_state._now", return_value=part.lease_until):
+            with self.assertRaises(StaleExportUpdateError):
+                heartbeat_part(
+                    part.pk,
+                    generation=generation,
+                    lease_id=lease_id,
+                    lease_until=part.lease_until + timedelta(minutes=1),
+                    processed_rows=999,
+                )
+            with self.assertRaises(StaleExportUpdateError):
+                begin_part_upload(part.pk, generation=generation, lease_id=lease_id)
+        begin_part_upload(part.pk, generation=generation, lease_id=lease_id)
+        with patch("apps.log_search.export_state._now", return_value=part.lease_until):
+            with self.assertRaises(StaleExportUpdateError):
+                complete_part(
+                    part.pk,
+                    generation=generation,
+                    lease_id=lease_id,
+                    actual_rows=999,
+                    actual_bytes=100,
+                    compressed_bytes=50,
+                    object_key="late",
+                    checksum="b" * 64,
+                )
+        part.refresh_from_db()
+        job.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.UPLOADING)
+        self.assertEqual(part.processed_rows, 0)
+        self.assertEqual(part.object_key, "")
+        self.assertEqual(job.actual_total, 0)
+
+    def test_heartbeat_cannot_shorten_lease(self):
+        part, lease_id, generation = self.dispatch_and_claim(self.activate_plan(self.create_job()).parts.get())
+        with self.assertRaises(ExportStateError):
+            heartbeat_part(
+                part.pk,
+                generation=generation,
+                lease_id=lease_id,
+                lease_until=part.lease_until - timedelta(seconds=1),
+            )
+        original_expiry = part.lease_until
+        part.refresh_from_db()
+        self.assertEqual(part.lease_until, original_expiry)
+
+    def test_failed_job_rejects_upload_and_commit_and_does_not_requeue_workers(self):
+        job = self.create_job()
+        plan = self.activate_plan(job, parts=[PartSpec(1, 0, 10), PartSpec(2, 10, 20)])
+        running, lease1, generation1 = self.dispatch_and_claim(plan.parts.get(part_no=1))
+        uploading, lease2, generation2 = self.dispatch_and_claim(plan.parts.get(part_no=2))
+        begin_part_upload(uploading.pk, generation=generation2, lease_id=lease2)
+        failed = fail_job(job.pk, error_code="JOB_TIMEOUT")
+        with self.assertRaises(StaleExportUpdateError):
+            begin_part_upload(running.pk, generation=generation1, lease_id=lease1)
+        with self.assertRaises(StaleExportUpdateError):
+            complete_part(
+                uploading.pk,
+                generation=generation2,
+                lease_id=lease2,
+                actual_rows=999,
+                actual_bytes=100,
+                compressed_bytes=50,
+                object_key="late",
+                checksum="b" * 64,
+            )
+        for part, lease, generation in [(running, lease1, generation1), (uploading, lease2, generation2)]:
+            retry_part(part.pk, generation=generation, lease_id=lease, error_code="STOPPED", error_detail="")
+            part.refresh_from_db()
+            self.assertEqual(part.status, ExportPart.Status.CANCELED)
+            self.assertEqual(part.lease_id, "")
+        job.refresh_from_db()
+        self.assertEqual(job.status, ExportJob.Status.FAILED)
+        self.assertEqual(job.actual_total, 0)
+        self.assertEqual(job.state_version, failed.state_version)
+
+    def test_repeated_cancel_preserves_terminal_metadata_and_running_lease(self):
+        job = self.create_job()
+        part, lease_id, generation = self.dispatch_and_claim(self.activate_plan(job).parts.get())
+        canceled = cancel_job(job.pk)
+        again = cancel_job(job.pk)
+        self.assertEqual(again.completed_at, canceled.completed_at)
+        self.assertEqual(again.state_version, canceled.state_version)
+        part.refresh_from_db()
+        self.assertEqual(part.lease_id, lease_id)
+        # The worker still owns its budget while the already-started I/O exits.
+        heartbeat_part(
+            part.pk,
+            generation=generation,
+            lease_id=lease_id,
+            lease_until=part.lease_until + timedelta(seconds=1),
+        )
+        retry_part(part.pk, generation=generation, lease_id=lease_id, error_code="CANCELED", error_detail="")
+        part.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.CANCELED)
+
+    def test_plan_rejects_mismatched_query_snapshot(self):
+        job = self.create_job()
+        begin_planning(job.pk)
+        with self.assertRaises(PlanValidationError):
+            persist_plan(
+                job.pk,
+                attempt=claim_planning(job_id=job.pk),
+                query_hash="different-query",
+                target_rows=1,
+                target_bytes=1,
+                histogram_interval=1,
+                parts=[PartSpec(1, 0, 20)],
+            )
+        self.assertFalse(job.plans.exists())
+
+    def test_success_lifetime_starts_at_manifest_commit(self):
+        job = self.create_job()
+        plan = self.activate_plan(job)
+        part, lease, generation = self.dispatch_and_claim(plan.parts.get())
+        self.complete_claimed_part(part, lease, generation)
+        completed_at = timezone.now() + timedelta(hours=2)
+        with patch("apps.log_search.export_state._now", return_value=completed_at):
+            finalized = finalize_job_success(
+                job.pk,
+                plan_version=1,
+                manifest_object_key="manifest",
+                manifest_checksum="c" * 64,
+            )
+        self.assertEqual(finalized.completed_at, completed_at)
+        self.assertEqual(finalized.expires_at, completed_at + timedelta(hours=24))
+
+    def test_delayed_publish_ack_after_worker_success_is_idempotent(self):
+        job = self.create_job()
+        part = self.activate_plan(job).parts.get()
+        dispatch_part(part.pk, lease_id="lease", task_id="task", lease_until=timezone.now() + timedelta(minutes=5))
+        claim_part(part.pk, generation=1, lease_id="lease", worker_id="worker")
+        self.complete_claimed_part(part, "lease", 1)
+        first = mark_part_published(part.pk, generation=1)
+        second = mark_part_published(part.pk, generation=1, published_at=timezone.now() + timedelta(seconds=1))
+        self.assertEqual(second.status, ExportPart.Status.SUCCESS)
+        self.assertEqual(second.published_at, first.published_at)
+        with self.assertRaises(StaleExportUpdateError):
+            mark_part_published(part.pk, generation=2)
+
+    @override_settings(ASYNC_EXPORT_MAX_LEAF_PARTS=2, ASYNC_EXPORT_MAX_ATTEMPTS=1)
+    def test_split_limit_and_invalid_estimates_roll_back_without_affecting_successful_sibling(self):
+        job = self.create_job()
+        plan = self.activate_plan(job, parts=[PartSpec(1, 0, 10), PartSpec(2, 10, 20)])
+        first, lease, generation = self.dispatch_and_claim(plan.parts.get(part_no=1))
+        self.complete_claimed_part(first, lease, generation, rows=7)
+        second, lease, generation = self.dispatch_and_claim(plan.parts.get(part_no=2))
+        retry_part(second.pk, generation=generation, lease_id=lease, error_code="OVERSIZED", error_detail="")
+        attempt = claim_planning(part_id=second.pk)
+        for children in [
+            [PartSpec(None, 10, 15), PartSpec(None, 15, 20)],
+            [PartSpec(None, 10, 15, estimated_rows=-1), PartSpec(None, 15, 20)],
+        ]:
+            with self.subTest(children=children), self.assertRaises(PlanValidationError):
+                split_part(second.pk, attempt=attempt, children=children)
+        second.refresh_from_db()
+        plan.refresh_from_db()
+        self.assertEqual(second.status, ExportPart.Status.FAILED)
+        self.assertTrue(second.is_leaf)
+        self.assertEqual(plan.part_count, 2)
+        with override_settings(ASYNC_EXPORT_MAX_LEAF_PARTS=3):
+            children = split_part(second.pk, attempt=attempt, children=[PartSpec(None, 10, 15), PartSpec(None, 15, 20)])
+        for child in children:
+            claimed, lease, generation = self.dispatch_and_claim(child)
+            self.complete_claimed_part(claimed, lease, generation, rows=3)
+        finalized = finalize_job_success(
+            job.pk, plan_version=1, manifest_object_key="manifest", manifest_checksum="c" * 64
+        )
+        self.assertEqual(finalized.actual_total, 13)
+        first.refresh_from_db()
+        self.assertEqual(first.attempts, 1)
+
+    def test_duplicate_delivery_and_old_failure_cannot_change_new_attempt(self):
+        job = self.create_job()
+        part, lease, generation = self.dispatch_and_claim(self.activate_plan(job).parts.get())
+        with self.assertRaises(StaleExportUpdateError):
+            claim_part(part.pk, generation=generation, lease_id=lease, worker_id="duplicate")
+        retry_part(part.pk, generation=generation, lease_id=lease, error_code="QUERY_FAILED", error_detail="")
+        current, current_lease, current_generation = self.dispatch_and_claim(part)
+        with self.assertRaises(StaleExportUpdateError):
+            retry_part(part.pk, generation=generation, lease_id=lease, error_code="LATE", error_detail="")
+        part.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.RUNNING)
+        self.assertEqual(part.attempts, 2)
+        self.assertEqual(part.dispatch_generation, current_generation)
+        self.assertEqual(part.lease_id, current_lease)
+
+    def test_initial_plan_enforces_500_leaf_limit_atomically(self):
+        job = self.create_job(end_time=501)
+        begin_planning(job.pk)
+        kwargs = dict(
+            attempt=claim_planning(job_id=job.pk),
+            query_hash=job.query_hash,
+            target_rows=1,
+            target_bytes=1,
+            histogram_interval=1,
+        )
+        with self.assertRaises(PlanValidationError):
+            persist_plan(job.pk, parts=[PartSpec(i + 1, i, i + 1) for i in range(501)], **kwargs)
+        self.assertFalse(job.plans.exists())
+        self.assertFalse(ExportPart.objects.exists())
+        plan = persist_plan(
+            job.pk,
+            parts=[PartSpec(i + 1, i, i + 1) for i in range(499)] + [PartSpec(500, 499, 501)],
+            **kwargs,
+        )
+        self.assertEqual(plan.part_count, 500)
+        self.assertEqual(plan.parts.count(), 500)
+
+    def test_plan_rejects_boundaries_that_cannot_be_expressed_at_job_precision(self):
+        job = self.create_job()
+        job.time_tick = 10
+        job.save(update_fields=["time_tick"])
+        with self.assertRaises(PlanValidationError):
+            self.activate_plan(job, parts=[PartSpec(1, 0, 5), PartSpec(2, 5, 20)])
+        self.assertFalse(job.plans.exists())
+
+    @override_settings(ASYNC_EXPORT_MAX_ATTEMPTS=1)
+    def test_split_uses_the_same_precision_validation_as_initial_plan(self):
+        job = self.create_job()
+        job.time_tick = 10
+        job.save(update_fields=["time_tick"])
+        part = self.activate_plan(job).parts.get()
+        _, lease, generation = self.dispatch_and_claim(part)
+        retry_part(part.pk, generation=generation, lease_id=lease, error_code="OVERSIZED", error_detail="")
+        attempt = claim_planning(part_id=part.pk)
+        with self.assertRaises(PlanValidationError):
+            split_part(part.pk, attempt=attempt, children=[PartSpec(None, 0, 5), PartSpec(None, 5, 20)])
+        part.refresh_from_db()
+        self.assertEqual(part.status, "FAILED")
+        self.assertFalse(part.children.exists())

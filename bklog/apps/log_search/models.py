@@ -93,6 +93,7 @@ from apps.log_search.exceptions import (
     SourceDuplicateException,
 )
 from apps.log_search.utils import fetch_request_username
+from apps.log_search.export_models import ExportArtifact, ExportDispatchGate, ExportJob, ExportPart, ExportPlan  # noqa: F401
 from apps.models import (
     JsonField,
     MultiStrSplitByCommaField,
@@ -1780,8 +1781,13 @@ class AsyncTask(OperateRecordModel):
         else:
             qs = qs.exclude(scenario_id=ASYNC_EXPORT_SCENE_ID)
 
+        new_count = 0
+        if settings.ASYNC_EXPORT_SHARDED_ENABLED or settings.ASYNC_EXPORT_CONTROL_ENABLED:
+            from apps.log_search.export_admission import active_job_count
+
+            new_count = active_job_count(username, is_scene=is_scene)
         if (
-            qs.filter(Q(export_status__in=running_status) | Q(export_status__isnull=True)).count()
+            qs.filter(Q(export_status__in=running_status) | Q(export_status__isnull=True)).count() + new_count
             >= settings.MAX_CONCURRENT_EXPORT_TASKS
         ):
             raise ConcurrentExportLimitException(
@@ -1793,7 +1799,8 @@ class AsyncTask(OperateRecordModel):
         """
         校验并创建异步导出任务
 
-        Redis 启用且可用时，在用户导出分组锁内完成并发数复检与任务创建，避免并发请求击穿限制；
+        新分片链路启用或仍在收尾时，用数据库分组锁统一新旧任务准入。
+        仅旧链路运行时，Redis 启用且可用则在用户导出分组锁内完成并发数复检与任务创建；
         Redis 禁用或连接异常时降级为非原子校验，极端并发下任务数可能短暂超过限制。
         """
 
@@ -1802,6 +1809,12 @@ class AsyncTask(OperateRecordModel):
             task_params["created_by"] = username
             task_params["export_type"] = ExportType.ASYNC
             return cls.objects.create(**task_params)
+
+        if settings.ASYNC_EXPORT_SHARDED_ENABLED or settings.ASYNC_EXPORT_CONTROL_ENABLED:
+            from apps.log_search.export_admission import admission_lock
+
+            with admission_lock(username, is_scene=is_scene):
+                return check_and_create_task()
 
         if not settings.USE_REDIS:
             return check_and_create_task()

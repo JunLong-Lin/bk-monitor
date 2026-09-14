@@ -232,6 +232,7 @@ CELERY_IMPORTS = (
     "apps.log_search.tasks.async_export",
     "apps.log_search.tasks.scene_async_export",
     "apps.log_search.tasks.unify_query_async_export",
+    "apps.log_search.tasks.sharded_export",
     "apps.log_search.tasks.project",
     "apps.log_search.tasks.space",
     "apps.log_search.tasks.cmdb",
@@ -1402,6 +1403,51 @@ TGPA_SDK_DOC_URL = os.getenv("BKAPP_TGPA_SDK_DOC_URL", "")
 
 # 异步下载最大并发任务数
 MAX_CONCURRENT_EXPORT_TASKS = int(os.getenv("BKAPP_MAX_CONCURRENT_EXPORT_TASKS", 3))
+
+# 异步分片导出的资源与故障恢复预算；实际容量仍需按部署环境验证。
+ASYNC_EXPORT_MAX_ATTEMPTS = int(os.getenv("BKAPP_ASYNC_EXPORT_MAX_ATTEMPTS", 3))
+ASYNC_EXPORT_MAX_LEAF_PARTS = int(os.getenv("BKAPP_ASYNC_EXPORT_MAX_LEAF_PARTS", 500))
+# The new route stays closed until protocol/capacity verification and Worker integration.
+ASYNC_EXPORT_SHARDED_ENABLED = os.getenv("BKAPP_ASYNC_EXPORT_SHARDED_ENABLED", "off") == "on"
+# Separate route admission from control processing so disabling new creation
+# does not strand already-admitted Jobs during a rollback.
+ASYNC_EXPORT_CONTROL_ENABLED = os.getenv("BKAPP_ASYNC_EXPORT_CONTROL_ENABLED", "off") == "on"
+ASYNC_EXPORT_VERIFIED_QUERY_KINDS = []
+# Set only after the corresponding boundary protocol is verified; no implicit default.
+ASYNC_EXPORT_QUERY_END_MODES = {}
+ASYNC_EXPORT_ADAPTER_FACTORY = "apps.log_search.export_adapter.native_query_factory"
+ASYNC_EXPORT_PART_TASK = "apps.log_search.tasks.sharded_export.execute_sharded_export_part"
+ASYNC_EXPORT_ARTIFACT_STORE_FACTORY = ""
+ASYNC_EXPORT_LOCAL_ARTIFACT_ROOT = ""
+ASYNC_EXPORT_WORKER_POLICY = {}
+ASYNC_EXPORT_PART_RETRY_SECONDS = 10
+ASYNC_EXPORT_COS = {}  # Bucket, Region, SecretId, SecretKey; never store credentials in Job snapshots.
+ASYNC_EXPORT_COS_TIMEOUT = 15
+ASYNC_EXPORT_COS_PUT_ATTEMPTS = 3
+ASYNC_EXPORT_FINALIZATION_ATTEMPTS = 3
+ASYNC_EXPORT_FINALIZATION_DEADLINE = 120
+ASYNC_EXPORT_FINALIZATION_RETRY = 10
+ASYNC_EXPORT_CLEANUP_DEADLINE = 30
+ASYNC_EXPORT_TEMP_ROOT = ""  # Local disk only; defaults to the operating system temp directory.
+ASYNC_EXPORT_TEMP_RETENTION_SECONDS = 3600
+ASYNC_EXPORT_FINALIZE_TASK = ""
+ASYNC_EXPORT_QUEUE = "sharded_async_export"
+ASYNC_EXPORT_OVERSIZED_QUEUE = "sharded_async_export_oversized"
+ASYNC_EXPORT_CONTROL_QUEUE = "sharded_async_export_control"
+ASYNC_EXPORT_NAMESPACE = os.getenv(
+    "BKAPP_ASYNC_EXPORT_NAMESPACE", f"{APP_CODE}:{os.getenv('BKPAAS_ENVIRONMENT', 'dev')}:sharded-export"
+)
+ASYNC_EXPORT_GLOBAL_LIMIT = int(os.getenv("BKAPP_ASYNC_EXPORT_GLOBAL_LIMIT", 0))
+ASYNC_EXPORT_INDEX_LIMIT = int(os.getenv("BKAPP_ASYNC_EXPORT_INDEX_LIMIT", 4))
+ASYNC_EXPORT_OVERSIZED_LIMIT = int(os.getenv("BKAPP_ASYNC_EXPORT_OVERSIZED_LIMIT", 0))
+# Must be supplied after measuring bounded I/O; zero disables new dispatch.
+ASYNC_EXPORT_LEASE_SECONDS = int(os.getenv("BKAPP_ASYNC_EXPORT_LEASE_SECONDS", 0))
+ASYNC_EXPORT_SCAN_LIMIT = 100
+ASYNC_EXPORT_PLANNING_ATTEMPTS = 3
+ASYNC_EXPORT_PLANNING_DEADLINE = 600
+ASYNC_EXPORT_PLANNING_LEASE_SECONDS = 60
+ASYNC_EXPORT_PLANNING_RETRY_SECONDS = 10
+ASYNC_EXPORT_PLANNER_POLICY = {}
 
 """
 以下为框架代码 请勿修改

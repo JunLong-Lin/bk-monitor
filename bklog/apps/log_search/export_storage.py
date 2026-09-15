@@ -230,7 +230,8 @@ class BKRepoArtifactStore(RegisteredArtifactStore):
 
     def _matches(self, response, record):
         headers = self._headers(response)
-        return headers.get("content-length") == str(record.size) and headers.get("x-bkrepo-sha256") == record.checksum
+        checksum = headers.get("x-checksum-sha256") or headers.get("x-bkrepo-sha256")
+        return headers.get("content-length") == str(record.size) and checksum == record.checksum
 
     def head(self, key, guard):
         response = self.client.head(self._key(key), min(guard(), settings.ASYNC_EXPORT_BKREPO_TIMEOUT))

@@ -74,7 +74,7 @@ class MemoryBKRepo:
         body, checksum = self.objects[key]
         return self.response(
             200,
-            headers={"Content-Length": str(len(body)), "X-BKREPO-SHA256": checksum},
+            headers={"Content-Length": str(len(body)), "X-Checksum-Sha256": checksum},
         )
 
     def put(self, key, stream, size, checksum, timeout):

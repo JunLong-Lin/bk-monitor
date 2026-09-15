@@ -3,22 +3,29 @@ import base64
 import json
 import tempfile
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from contextlib import contextmanager
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import requests
 from django.test import TestCase, override_settings
 from django.utils import timezone
-from qcloud_cos.cos_exception import CosServiceError
 from qcloud_cos import CosConfig, CosS3Client
+from qcloud_cos.cos_exception import CosServiceError
 
 from apps.log_search import export_state as state
 from apps.log_search.export_finalize import cleanup_export, finalize_export
 from apps.log_search.export_models import ExportJob
-from apps.log_search.export_storage import CosArtifactStore, artifact_prefix
-from apps.log_search.export_worker import Artifact, UnconfirmedQueryExit, run_part
+from apps.log_search.export_storage import (
+    BKRepoArtifactStore,
+    BKRepoHttpClient,
+    CosArtifactStore,
+    artifact_prefix,
+    bkrepo_artifact_store,
+)
+from apps.log_search.export_worker import Artifact, PartError, UnconfirmedQueryExit, run_part
 from apps.log_search.tests.export_fixtures import create_job
 
 
@@ -47,6 +54,44 @@ class MemoryCos:
 
     def delete_object(self, *, Bucket, Key):
         self.objects.pop(Key, None)
+
+
+class MemoryBKRepo:
+    def __init__(self):
+        self.objects = {}
+        self.puts = 0
+        self.put_effect = None
+
+    @staticmethod
+    def response(status_code, data=None, headers=None):
+        response = Mock(status_code=status_code, headers=headers or {})
+        response.json.return_value = data if data is not None else {"code": 0, "data": None}
+        return response
+
+    def head(self, key, timeout):
+        if key not in self.objects:
+            return self.response(404)
+        body, checksum = self.objects[key]
+        return self.response(
+            200,
+            headers={"Content-Length": str(len(body)), "X-BKREPO-SHA256": checksum},
+        )
+
+    def put(self, key, stream, size, checksum, timeout):
+        self.puts += 1
+        if self.put_effect:
+            return self.put_effect(key, stream, size, checksum, timeout)
+        if key in self.objects:
+            return self.response(409, {"code": 250107, "message": "exists"})
+        body = stream.read()
+        self.objects[key] = body, checksum
+        return self.response(200)
+
+    def delete(self, key, timeout):
+        if key not in self.objects:
+            return self.response(404)
+        self.objects.pop(key)
+        return self.response(200)
 
 
 @override_settings(ASYNC_EXPORT_LEASE_SECONDS=60)
@@ -365,3 +410,166 @@ class ArtifactFlowTest(TestCase):
         self.assertEqual(part.lease_id, "owner")
         self.assertEqual(self.job.artifacts.get().status, "UPLOADING")
         budget.release.assert_not_called()
+
+
+@override_settings(
+    ASYNC_EXPORT_LEASE_SECONDS=60,
+    ASYNC_EXPORT_BKREPO_TIMEOUT=15,
+    ASYNC_EXPORT_BKREPO_PUT_ATTEMPTS=3,
+)
+class BKRepoArtifactStoreTest(TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.client = MemoryBKRepo()
+        self.store = BKRepoArtifactStore(self.client, "bkrepo-storage", "export-root")
+        self.job = create_job()
+        state.begin_planning(self.job.pk)
+        self.plan = state.persist_plan(
+            self.job.pk,
+            attempt=state.claim_planning(job_id=self.job.pk),
+            query_hash=self.job.query_hash,
+            target_rows=100,
+            target_bytes=100,
+            histogram_interval=60,
+            parts=[state.PartSpec(1, 0, 60, 1, 10)],
+        )
+
+    def artifact(self, content=b"bkrepo-fixture"):
+        path = Path(self.temp.name) / "artifact"
+        path.write_bytes(content)
+        checksum = hashlib.sha256(content).hexdigest()
+        return Artifact(path, 1, len(content), len(content), checksum, checksum)
+
+    def start_part(self):
+        part = self.plan.parts.get()
+        state.dispatch_part(
+            part.pk, lease_id="owner", task_id="task", lease_until=timezone.now() + timedelta(seconds=60)
+        )
+        part.refresh_from_db()
+        credentials = dict(generation=part.dispatch_generation, lease_id="owner")
+        state.claim_part(part.pk, **credentials, worker_id="worker")
+        state.begin_part_upload(part.pk, **credentials)
+        part.plan.job.refresh_from_db()
+        return part, credentials
+
+    def complete_part(self, content=b"bkrepo-fixture"):
+        part, credentials = self.start_part()
+        artifact = self.artifact(content)
+        key = self.store.publish(part, artifact, lambda: 30)
+        state.complete_part(
+            part.pk,
+            **credentials,
+            actual_rows=1,
+            actual_bytes=artifact.size,
+            compressed_bytes=artifact.compressed_size,
+            object_key=key,
+            checksum=artifact.checksum,
+        )
+        self.job.refresh_from_db()
+        return part, artifact
+
+    def test_part_manifest_and_cleanup_use_bkrepo(self):
+        part, artifact = self.complete_part()
+        part.refresh_from_db()
+        puts = self.client.puts
+        self.assertEqual(self.store.publish(part, artifact, lambda: 30), part.object_key)
+        self.assertEqual(self.client.puts, puts)
+
+        result = finalize_export(self.job.pk, self.store)
+        self.assertEqual(result.status, ExportJob.Status.SUCCESS)
+        manifest_key = self.store._key(result.manifest_object_key)
+        manifest = json.loads(self.client.objects[manifest_key][0])
+        self.assertEqual(manifest["actual_total"], 1)
+        ExportJob.objects.filter(pk=self.job.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
+        self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
+        self.assertEqual(self.client.objects, {})
+
+    def test_lost_put_response_is_reconciled_by_head(self):
+        part, _credentials = self.start_part()
+        artifact = self.artifact()
+
+        def stored_then_timeout(key, stream, size, checksum, timeout):
+            self.client.objects[key] = stream.read(), checksum
+            raise requests.Timeout()
+
+        self.client.put_effect = stored_then_timeout
+        key = self.store.publish(part, artifact, lambda: 30)
+        self.assertEqual(key, self.job.artifacts.get().object_key)
+        self.assertEqual(self.job.artifacts.get().status, "READY")
+        self.assertEqual(self.client.puts, 1)
+
+    def test_unconfirmed_put_retains_uploading_marker(self):
+        part, _credentials = self.start_part()
+        artifact = self.artifact()
+
+        def timeout(*args):
+            raise requests.Timeout()
+
+        self.client.put_effect = timeout
+        with self.assertRaisesMessage(UnconfirmedQueryExit, "UPLOAD_EXIT_UNCONFIRMED"):
+            self.store.publish(part, artifact, lambda: 30)
+        self.assertEqual(self.client.puts, 3)
+        self.assertEqual(self.job.artifacts.get().status, "UPLOADING")
+
+    def test_existing_wrong_object_is_not_overwritten(self):
+        part, _credentials = self.start_part()
+        artifact = self.artifact()
+        key = f"{artifact_prefix(self.job)}{self.plan.plan_version}/{part.pk}/{artifact.checksum}.tar.gz"
+        self.client.objects[self.store._key(key)] = b"wrong", "bad-checksum"
+        with self.assertRaisesMessage(PartError, "ARTIFACT_VERIFICATION_FAILED"):
+            self.store.publish(part, artifact, lambda: 30)
+        self.assertEqual(self.client.puts, 0)
+        self.assertEqual(self.client.objects[self.store._key(key)][0], b"wrong")
+
+    @override_settings(
+        BKREPO_ENDPOINT_URL="https://repo.example.test",
+        BKREPO_USERNAME="user",
+        BKREPO_PASSWORD="password",
+        BKREPO_PROJECT="project",
+        BKREPO_BUCKET="bucket",
+        BKREPO_LOCATION="tenant-root",
+    )
+    def test_factory_reuses_existing_bkrepo_configuration(self):
+        store = bkrepo_artifact_store()
+        self.assertIsInstance(store.client, BKRepoHttpClient)
+        self.assertEqual(store.key_prefix, "tenant-root")
+        self.assertEqual(store.client.endpoint_url, "https://repo.example.test")
+        self.assertEqual(store.client.project, "project")
+        self.assertEqual(store.client.bucket, "bucket")
+
+    def test_http_client_encodes_keys_and_sends_immutable_checksum_headers(self):
+        received = []
+
+        class Endpoint(BaseHTTPRequestHandler):
+            def do_PUT(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append((self.path, body, dict(self.headers)))
+                self.send_response(200)
+                payload = b'{"code":0,"data":null}'
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        endpoint = HTTPServer(("127.0.0.1", 0), Endpoint)
+        thread = threading.Thread(target=endpoint.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = BKRepoHttpClient(
+                f"http://127.0.0.1:{endpoint.server_port}", "project", "bucket", "user", "password"
+            )
+            response = client.put("space/a file", b"wire", 4, "checksum", 2)
+            self.assertEqual(response.json()["code"], 0)
+            path, body, headers = received[0]
+            self.assertEqual(path, "/generic/project/bucket/space/a%20file")
+            self.assertEqual(body, b"wire")
+            self.assertEqual(headers["X-BKREPO-OVERWRITE"], "false")
+            self.assertEqual(headers["X-BKREPO-SHA256"], "checksum")
+            self.assertTrue(headers["Authorization"].startswith("Basic "))
+        finally:
+            endpoint.shutdown()
+            endpoint.server_close()
+            thread.join(timeout=2)

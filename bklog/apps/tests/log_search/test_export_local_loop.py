@@ -1,7 +1,7 @@
-"""Local integration: real HTTP/DataAPI, Redis Lua, Celery and file artifacts.
+"""本地集成：真实 HTTP/DataAPI、Redis Lua、Celery 与文件产物。
 
-UnifyQuery responses and metadata/authorization setup are controlled fixtures;
-this does not verify the production query service's scroll protocol.
+UnifyQuery 响应以及元数据/授权前置使用受控夹具，
+不验证生产查询服务的滚动协议。
 """
 
 import json
@@ -26,12 +26,12 @@ from django.test import TransactionTestCase, override_settings
 from django.db import connections
 
 from apps.api.modules.unify_query import _UnifyQueryApi
-from apps.log_search.export_adapter import NativeQuery, export_identity
-from apps.log_search.export_coordinator import Coordinator, RedisBudget
-from apps.log_search.export_models import ExportPart
-from apps.log_search.export_planner import plan_job
+from apps.log_search.export.adapter import NativeQuery, export_identity
+from apps.log_search.export.coordinator import Coordinator, RedisBudget
+from apps.log_search.export.models import ExportPart
+from apps.log_search.export.planner import plan_job
 from apps.log_search.tasks import sharded_export
-from apps.log_search.tests.export_fixtures import create_job
+from apps.tests.log_search.export_fixtures import create_job
 
 
 @skipUnless(shutil.which("redis-server"), "private Redis is required")
@@ -88,8 +88,8 @@ class LocalLoopTest(TransactionTestCase):
                 reject_on_worker_lost=True,
             )
             def execute_test_part(self, part_id):
-                # A private file DB survives Celery's connection cleanup and
-                # gives the coordinator and worker independent connections.
+                # 私有文件库可以躲过 Celery 的连接清理，
+                # 让 Coordinator 与 Worker 使用独立连接。
                 original = connections["default"]
                 worker_connection = type(original)(deepcopy(database_settings), alias="default")
                 connections["default"] = worker_connection
@@ -122,7 +122,7 @@ class LocalLoopTest(TransactionTestCase):
 
                 @contextmanager
                 def query_factory(job):
-                    with export_identity(job), patch("apps.log_search.export_adapter.UnifyQueryApi", _UnifyQueryApi()):
+                    with export_identity(job), patch("apps.log_search.export.adapter.UnifyQueryApi", _UnifyQueryApi()):
                         handler = Mock()
                         handler._deal_query_result.side_effect = lambda response: {"origin_log_list": response["list"]}
                         query = NativeQuery(job, handler)
@@ -144,7 +144,7 @@ class LocalLoopTest(TransactionTestCase):
                         ASYNC_EXPORT_LEASE_SECONDS=60,
                         ASYNC_EXPORT_NAMESPACE="isolated-local-loop",
                         ASYNC_EXPORT_LOCAL_ARTIFACT_ROOT=directory,
-                        ASYNC_EXPORT_ARTIFACT_STORE_FACTORY="apps.log_search.export_worker.local_artifact_store",
+                        ASYNC_EXPORT_ARTIFACT_STORE_FACTORY="apps.log_search.export.worker.local_artifact_store",
                     ),
                     patch.object(sharded_export, "adapter_factory", return_value=query_factory),
                     patch.object(sharded_export, "get_redis_connection", return_value=client),

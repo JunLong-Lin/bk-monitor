@@ -1,8 +1,7 @@
-"""Models used by the sharded asynchronous export workflow.
+"""分片异步导出流程使用的数据模型。
 
-The models deliberately do not inherit ``OperateRecordModel``.  ExportJob
-already has a task owner with a different length and meaning from the
-request-audit fields used by the common base model.
+这些模型刻意不继承 ``OperateRecordModel``：ExportJob 已有任务创建者，
+其长度和含义都与公共基类的请求审计字段不同。
 """
 
 from django.core.exceptions import ValidationError
@@ -22,7 +21,7 @@ class ExportRecord(models.Model):
 
 
 class PlanningRecord(ExportRecord):
-    """The same durable attempt lifecycle for initial and local planning."""
+    """初始规划与局部规划共用的持久化尝试生命周期。"""
 
     planning_attempts = models.PositiveIntegerField(default=0)
     planning_generation = models.PositiveBigIntegerField(default=0)
@@ -35,7 +34,7 @@ class PlanningRecord(ExportRecord):
 
 
 class ExportJob(PlanningRecord):
-    """The user-visible lifecycle for one logical export."""
+    """用户可见的一条逻辑导出任务生命周期。"""
 
     class QueryKind(models.TextChoices):
         SINGLE = "single", _("单索引")
@@ -69,8 +68,7 @@ class ExportJob(PlanningRecord):
     routing_snapshot = models.JSONField(_("固定路由快照"), default=dict, blank=True)
     resolved_resource_ids = models.JSONField(_("完整资源集合"), default=list, blank=True)
     policy_snapshot = models.JSONField(_("执行策略快照"), default=dict, blank=True)
-    # The unit and precision are defined by query_snapshot and remain stable
-    # for all parts of this job.
+    # 时间单位与精度由 query_snapshot 决定，且对该 Job 的所有分片保持稳定。
     start_time = models.BigIntegerField(_("包含的时间下界"))
     end_time = models.BigIntegerField(_("不包含的时间上界"))
     time_tick = models.PositiveBigIntegerField(_("最小时间步长"), validators=[MinValueValidator(1)])
@@ -120,7 +118,7 @@ class ExportJob(PlanningRecord):
 
 
 class ExportPlan(ExportRecord):
-    """A complete, versioned plan.  Only one version is active for a Job."""
+    """一份完整且带版本的计划；一个 Job 同时只有一个生效版本。"""
 
     class Status(models.TextChoices):
         PLANNING = "PLANNING", _("规划中")
@@ -156,7 +154,7 @@ class ExportPlan(ExportRecord):
 
 
 class ExportPart(PlanningRecord):
-    """One fixed half-open time range in a plan."""
+    """计划中一个固定的左闭右开时间范围。"""
 
     class Status(models.TextChoices):
         WAITING = "WAITING", _("待投递")
@@ -239,10 +237,10 @@ class ExportPart(PlanningRecord):
 
 
 class ExportDispatchGate(models.Model):
-    """Serialize ledger reconciliation and dispatch across coordinators.
+    """在多个 Coordinator 之间串行化账本重建与投递。
 
-    A database lock survives Redis loss without allowing two independent
-    replacement ledgers. The cursor persists round-robin position on restart.
+    数据库锁在 Redis 丢失后依然有效，可避免两个独立的替代账本同时生效；
+    cursor 用于在重启后保留轮转位置。
     """
 
     namespace = models.CharField(max_length=128, primary_key=True)
@@ -253,13 +251,11 @@ class ExportDispatchGate(models.Model):
 
 
 class ExportArtifact(ExportRecord):
-    """Register before remote I/O; unknown uploads are never guessed to be idle."""
+    """远端 I/O 之前先登记；状态未知的上传永远不被当作空闲处理。"""
 
     class Status(models.TextChoices):
         UPLOADING = "UPLOADING"
         READY = "READY"
-        DELETING = "DELETING"
-        DELETED = "DELETED"
 
     job = models.ForeignKey(ExportJob, on_delete=models.PROTECT, related_name="artifacts")
     object_key = models.CharField(max_length=512, unique=True)

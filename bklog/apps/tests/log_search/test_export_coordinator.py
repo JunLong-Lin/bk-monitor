@@ -11,10 +11,10 @@ import redis
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from apps.log_search.export_coordinator import BudgetUnavailable, Coordinator, Limits, PublishNotSent, RedisBudget
-from apps.log_search.export_models import ExportJob, ExportPart
-from apps.log_search.tests.export_fixtures import create_job
-from apps.log_search import export_state as state
+from apps.log_search.export.coordinator import BudgetUnavailable, Coordinator, Limits, PublishNotSent, RedisBudget
+from apps.log_search.export.models import ExportJob, ExportPart
+from apps.tests.log_search.export_fixtures import create_job
+from apps.log_search.export import state
 
 
 class CoordinatorTest(TestCase):
@@ -64,7 +64,7 @@ class CoordinatorTest(TestCase):
         super().tearDownClass()
 
     def setUp(self):
-        self.redis_client.flushdb()  # Private unix socket, never a deployment Redis.
+        self.redis_client.flushdb()  # 私有 unix socket，绝不连接部署环境的 Redis。
         self.budget = RedisBudget(self.redis_client, "test-environment")
         self.publish = Mock()
         self.coordinator = Coordinator(
@@ -131,18 +131,16 @@ class CoordinatorTest(TestCase):
         self.assertEqual(len(retained), 4)
         self.assertEqual(self.coordinator.tick(), [])
 
-    def test_confirmed_stop_reclaims_expired_execution(self):
+    def test_expired_running_execution_keeps_its_reservation(self):
         _, plan = self.ready()
         part = self.coordinator.reserve()
         state.claim_part(part.pk, generation=1, lease_id=part.lease_id, worker_id="worker")
         ExportPart.objects.filter(pk=part.pk).update(lease_until=timezone.now() - timedelta(seconds=1))
-        self.assertEqual(self.coordinator.recover_expired(lambda part: True), [])
+        self.assertEqual(self.coordinator.recover_expired(), [part.pk])
         part.refresh_from_db()
-        self.assertEqual(part.status, "WAITING")
+        self.assertEqual(part.status, "RUNNING")
         self.assertEqual(part.attempts, 1)
-        replacement = self.coordinator.reserve()
-        self.assertEqual(replacement.pk, part.pk)
-        self.assertEqual(replacement.dispatch_generation, 2)
+        self.assertEqual(part.dispatch_generation, 1)
 
     def test_expired_unclaimed_delivery_can_be_released_without_io_proof(self):
         self.ready()
@@ -201,20 +199,20 @@ class CoordinatorTest(TestCase):
         self.assertFalse(self.budget.release(part.pk, 1, "wrong"))
         self.assertTrue(self.redis_client.hexists(self.budget.key, str(part.pk)))
         future = part.lease_until + timedelta(seconds=1)
-        with patch("apps.log_search.export_coordinator.timezone.now", return_value=future):
+        with patch("apps.log_search.export.coordinator.timezone.now", return_value=future):
             self.assertFalse(self.budget.renew(part.pk, 1, part.lease_id, future + timedelta(minutes=1)))
 
     def test_db_rollback_after_reservation_leaves_no_dispatch_and_rebuild_removes_orphan(self):
         self.ready()
-        with patch("apps.log_search.export_coordinator.state.dispatch_part", side_effect=RuntimeError("crash")):
+        with patch("apps.log_search.export.coordinator.state.dispatch_part", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.coordinator.reserve()
         self.assertFalse(ExportPart.objects.filter(status="DISPATCHED").exists())
         self.coordinator.reconcile()
-        self.assertEqual(self.redis_client.hlen(self.budget.key), 1)  # epoch only
+        self.assertEqual(self.redis_client.hlen(self.budget.key), 1)  # 只剩 epoch
 
     def test_parallelism_reduction_waits_for_existing_work(self):
-        from apps.log_search.export_state import set_parallelism
+        from apps.log_search.export.state import set_parallelism
 
         job, _ = self.ready()
         self.coordinator.tick()
@@ -252,19 +250,16 @@ class CoordinatorTest(TestCase):
         self.assertEqual(len(parts), 2)
         self.assertEqual(ExportPart.objects.filter(status="DISPATCHED", oversized=False).count(), 1)
 
-    def test_recovery_rechecks_generation_after_external_stop_verification(self):
+    def test_recovery_skips_a_candidate_whose_credential_changed(self):
         self.ready()
         part = self.coordinator.reserve()
-        state.claim_part(part.pk, generation=1, lease_id=part.lease_id, worker_id="worker")
-        ExportPart.objects.filter(pk=part.pk).update(lease_until=timezone.now() - timedelta(seconds=1))
-
-        def changed(candidate):
-            ExportPart.objects.filter(pk=part.pk).update(dispatch_generation=2)
-            return True
-
-        self.coordinator.recover_expired(changed)
+        stale = ExportPart.objects.get(pk=part.pk)
+        ExportPart.objects.filter(pk=part.pk).update(
+            dispatch_generation=2, lease_until=timezone.now() + timedelta(minutes=1)
+        )
+        self.assertFalse(state.recover_expired_part(stale))
         part.refresh_from_db()
-        self.assertEqual(part.status, "RUNNING")
+        self.assertEqual(part.status, "DISPATCHED")
         self.assertEqual(part.dispatch_generation, 2)
 
     def test_unconfirmed_execution_does_not_starve_later_expired_dispatch(self):
@@ -301,7 +296,7 @@ class CoordinatorTest(TestCase):
         incomplete, _ = self.ready()
         first, first_plan = self.ready()
         second, second_plan = self.ready()
-        # Completed leaf records are fixtures for discovery, not Worker tests.
+        # 已完成叶子只是供扫描发现用的夹具，不测试 Worker。
         for job, plan in [(first, first_plan), (second, second_plan)]:
             ExportJob.objects.filter(pk=job.pk).update(status="RUNNING")
             plan.parts.update(status="SUCCESS", actual_rows=1)
@@ -341,7 +336,7 @@ class AdmissionTest(TestCase):
         from apps.log_search.models import AsyncTask
         from apps.log_search.constants import ExportType
         from apps.log_search.exceptions import ConcurrentExportLimitException
-        from apps.log_search.export_admission import create_job as admit
+        from apps.log_search.export.admission import create_job as admit
 
         for _ in range(3):
             AsyncTask.objects.create(created_by="alice", export_type=ExportType.ASYNC, request_param={})
@@ -362,7 +357,7 @@ class AdmissionTest(TestCase):
         self.assertEqual(admit(**values).status, ExportJob.Status.PENDING)
 
     def test_same_request_is_idempotent_even_at_capacity(self):
-        from apps.log_search.export_admission import create_job as admit
+        from apps.log_search.export.admission import create_job as admit
 
         values = dict(
             bk_tenant_id="tenant",

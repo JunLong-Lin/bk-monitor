@@ -1,4 +1,4 @@
-"""Build trusted single-index snapshots before durable, shared admission."""
+"""在持久化的共享准入之前，构造可信的单索引快照。"""
 
 import hashlib
 import json
@@ -9,11 +9,11 @@ from types import SimpleNamespace
 from django.conf import settings
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
-from apps.log_search import export_admission
-from apps.log_search.export_adapter import export_identity, projection_snapshot
-from apps.log_search.export_api import ExportConflict, authorized_scope, job_detail
-from apps.log_search.export_contracts import ExportStateError, PlannerPolicy
-from apps.log_search.export_models import ExportJob
+from apps.log_search.export import admission
+from apps.log_search.export.adapter import export_identity, projection_snapshot
+from apps.log_search.export.api import ExportConflict, authorized_scope, job_detail
+from apps.log_search.export.contracts import ExportStateError, PlannerPolicy
+from apps.log_search.export.models import ExportJob
 from apps.log_search.handlers.search.search_handlers_esquery import SearchHandler
 from apps.log_search.models import AsyncTask
 from apps.log_unifyquery.handler.base import UnifyQueryHandler
@@ -38,7 +38,7 @@ def create_export(request, data):
     if not settings.ASYNC_EXPORT_SHARDED_ENABLED:
         raise ValidationError("EXPORT_ROUTE_DISABLED")
     try:
-        export_admission.validate_runtime_configuration()
+        admission.validate_runtime_configuration()
     except ExportStateError as error:
         raise ValidationError("EXPORT_RUNTIME_NOT_READY") from error
     end_mode = settings.ASYNC_EXPORT_QUERY_END_MODES.get("single")
@@ -50,9 +50,9 @@ def create_export(request, data):
     identity = dict(bk_tenant_id=get_request_tenant_id(), space_uid=space.space_uid, created_by=username)
     source_app = get_request_app_code()
     request_hash = digest({"input": data, "source_app_code": source_app})
-    # Check before Handler initialization (which can resolve metadata remotely).
-    # Final admission rechecks under the same lock after building the snapshot.
-    with export_admission.admission_lock(username):
+    # 在 Handler 初始化之前先检查（初始化可能远程解析元数据）；
+    # 快照构造完成后会在同一把锁内复检最终准入。
+    with admission.admission_lock(username):
         if data["request_id"]:
             existing = ExportJob.objects.filter(**identity, request_id=data["request_id"]).first()
             if existing:
@@ -76,8 +76,8 @@ def create_export(request, data):
     )
     with export_identity(context):
         handler = UnifyQueryHandler(deepcopy(params))
-        # Freeze the resolved default/user sort so later preferences cannot
-        # silently change the task. Validate explicit and resolved sorts alike.
+        # 冻结解析后的默认/用户排序，避免后续偏好变化静默改变任务；
+        # 显式排序与解析结果使用同一套校验。
         sort_list = deepcopy(handler.origin_order_by)
         if sort_list:
             handler.check_sort_list(handler.fields()["fields"], sort_list)
@@ -116,9 +116,9 @@ def create_export(request, data):
     )
     values["query_hash"] = digest({key: value for key, value in values.items() if key != "request_id"})
     try:
-        job = export_admission.create_job(**values)
+        job = admission.create_job(**values)
     except ExportStateError as error:
         raise ExportConflict("EXPORT_CREATE_CONFLICT") from error
-    # PENDING is durable work discovered by Coordinator. No broker publication
-    # or count query occurs in this request, including the commit failure path.
+    # PENDING 是留给 Coordinator 发现的持久化工作；本次请求不发布 broker
+    # 消息、不执行 count 查询，提交失败路径同样如此。
     return job_detail(job.pk)

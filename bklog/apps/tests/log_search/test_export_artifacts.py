@@ -15,18 +15,18 @@ from django.utils import timezone
 from qcloud_cos import CosConfig, CosS3Client
 from qcloud_cos.cos_exception import CosServiceError
 
-from apps.log_search import export_state as state
-from apps.log_search.export_finalize import cleanup_export, finalize_export
-from apps.log_search.export_models import ExportJob
-from apps.log_search.export_storage import (
+from apps.log_search.export import state
+from apps.log_search.export.finalize import cleanup_export, finalize_export
+from apps.log_search.export.models import ExportJob
+from apps.log_search.export.storage import (
     BKRepoArtifactStore,
     BKRepoHttpClient,
     CosArtifactStore,
     artifact_prefix,
     bkrepo_artifact_store,
 )
-from apps.log_search.export_worker import Artifact, PartError, UnconfirmedQueryExit, run_part
-from apps.log_search.tests.export_fixtures import create_job
+from apps.log_search.export.worker import Artifact, PartError, UnconfirmedQueryExit, run_part
+from apps.tests.log_search.export_fixtures import create_job
 
 
 def cos_error(code=404, name="NoSuchKey"):
@@ -224,8 +224,9 @@ class ArtifactFlowTest(TestCase):
 
         with patch.object(self.client, "delete_object", side_effect=lost_response):
             self.assertEqual(cleanup_export(self.job.pk, self.store), 0)
-        self.assertEqual(self.job.artifacts.filter(status="DELETING").count(), 2)
+        self.assertEqual(self.job.artifacts.filter(status="READY").count(), 2)
         self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
+        self.assertFalse(self.job.artifacts.exists())
 
     def test_manifest_failure_retries_only_finalization(self):
         self.complete_parts()
@@ -251,7 +252,7 @@ class ArtifactFlowTest(TestCase):
         self.assertEqual(self.job.finalization_attempts, 0)
 
     def test_local_package_change_is_rejected_before_put(self):
-        from apps.log_search.export_worker import PartError
+        from apps.log_search.export.worker import PartError
 
         self.complete_parts()
         artifact = self.artifact(b"original")
@@ -284,7 +285,7 @@ class ArtifactFlowTest(TestCase):
         with patch.object(self.client, "delete_object", side_effect=TimeoutError()):
             self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 0)
         self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 1)
-        self.assertEqual(self.job.artifacts.filter(status="DELETING").count(), 1)
+        self.assertEqual(self.job.artifacts.count(), 1)
 
     def test_finalization_attempts_exhaust_without_reexport(self):
         self.complete_parts()

@@ -6,16 +6,16 @@ from unittest.mock import Mock, patch
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from apps.log_search.export_models import ExportJob, ExportPart
-from apps.log_search.export_contracts import PlannerPolicy, PlanningError
-from apps.log_search.export_planner import (
+from apps.log_search.export.models import ExportJob, ExportPart
+from apps.log_search.export.contracts import PlannerPolicy, PlanningError
+from apps.log_search.export.planner import (
     AdaptivePlanner,
     plan_job,
     replan_failed_part,
 )
-from apps.log_search import export_state as state
-from apps.log_search.export_query import UnifyQueryStatistics
-from apps.log_search.tests.export_fixtures import create_job, Distribution
+from apps.log_search.export import state
+from apps.log_search.export.query import UnifyQueryStatistics
+from apps.tests.log_search.export_fixtures import create_job, Distribution
 
 
 class AdaptivePlannerTest(TestCase):
@@ -240,7 +240,7 @@ class PlanningStateTest(TestCase):
             clock[0] = 121
             yield statistics
 
-        with patch("apps.log_search.export_planner.time.monotonic", side_effect=lambda: clock[0]):
+        with patch("apps.log_search.export.planner.time.monotonic", side_effect=lambda: clock[0]):
             plan_job(job.pk, factory)
         job.refresh_from_db()
         self.assertEqual(job.error_code, "PLANNING_BUDGET_EXCEEDED")
@@ -251,7 +251,7 @@ class PlanningStateTest(TestCase):
         now = timezone.now()
         job = create_job(planning_started_at=now - timedelta(seconds=2))
         stats = Distribution({})
-        with patch("apps.log_search.export_state._now", return_value=now):
+        with patch("apps.log_search.export.state._now", return_value=now):
             plan_job(job.pk, lambda current: stats)
         self.assertEqual(stats.calls[0][-1], 1)
         job.refresh_from_db()
@@ -297,7 +297,7 @@ class PlanningStateTest(TestCase):
         job = create_job()
         plan = plan_job(job.pk, lambda current: Distribution({}))
         part = plan.parts.get()
-        # A finished execution is the starting state for a local planner.
+        # 对局部规划而言，一次已结束的执行就是起始状态。
         ExportJob.objects.filter(pk=job.pk).update(status="RUNNING")
         ExportPart.objects.filter(pk=part.pk).update(status="FAILED", attempts=3, error_code="OVERSIZED")
         first = state.claim_planning(part_id=part.pk)

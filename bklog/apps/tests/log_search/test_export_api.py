@@ -9,11 +9,11 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.test import APIRequestFactory
 from rest_framework.routers import SimpleRouter
 
-from apps.log_search import export_state as state
-from apps.log_search.export_api import ExportConflict, authorized_job, job_detail, operate_job
-from apps.log_search.export_models import ExportJob, ExportPart
+from apps.log_search.export import state
+from apps.log_search.export.api import ExportConflict, authorized_job, job_detail, operate_job
+from apps.log_search.export.models import ExportJob, ExportPart
 from apps.log_search.models import LogIndexSet, Space
-from apps.log_search.tests.export_fixtures import create_job
+from apps.tests.log_search.export_fixtures import create_job
 from apps.log_search.views.export_views import ExportJobViewSet, ExportParallelismSerializer
 
 
@@ -26,7 +26,7 @@ class ExportAPITest(TestCase):
             ("get_request_tenant_id", "tenant"),
             ("get_request_app_code", "app"),
         ]:
-            mock = patch(f"apps.log_search.export_api.{name}", return_value=value)
+            mock = patch(f"apps.log_search.export.api.{name}", return_value=value)
             setattr(self, name, mock.start())
             self.addCleanup(mock.stop)
 
@@ -117,9 +117,9 @@ class ExportAPITest(TestCase):
         LogIndexSet.objects.create(index_set_id=1, space_uid="space")
         with (
             patch(
-                "apps.log_search.export_api.BusinessActionPermission.has_permission", return_value=True
+                "apps.log_search.export.api.BusinessActionPermission.has_permission", return_value=True
             ) as space_permission,
-            patch("apps.log_search.export_api.IAMPermission.has_permission", return_value=True) as permission,
+            patch("apps.log_search.export.api.IAMPermission.has_permission", return_value=True) as permission,
         ):
             self.assertEqual(authorized_job(None, self.job.pk, "space").pk, self.job.pk)
             self.assertFalse(job_detail(self.job.pk)["can_operate"])

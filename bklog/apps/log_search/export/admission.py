@@ -1,4 +1,4 @@
-"""Shared admission for old and new jobs when the sharded route is enabled."""
+"""分片链路启用后，新旧任务共用的准入控制。"""
 
 import hashlib
 from contextlib import contextmanager
@@ -6,12 +6,12 @@ from contextlib import contextmanager
 from django.conf import settings
 from django.db import transaction
 
-from apps.log_search.export_models import ExportDispatchGate, ExportJob
-from apps.log_search.export_contracts import ExportStateError
+from apps.log_search.export.models import ExportDispatchGate, ExportJob
+from apps.log_search.export.contracts import ExportStateError
 
 
 def validate_runtime_configuration():
-    """Reject activation unless an admitted Job can reach a terminal state."""
+    """准入的 Job 必须能走到终态，否则拒绝启用新链路。"""
     required = {
         "ASYNC_EXPORT_CONTROL_ENABLED": settings.ASYNC_EXPORT_CONTROL_ENABLED,
         "ASYNC_EXPORT_ADAPTER_FACTORY": settings.ASYNC_EXPORT_ADAPTER_FACTORY,
@@ -32,8 +32,8 @@ def validate_runtime_configuration():
 
 @contextmanager
 def admission_lock(username, is_scene=False):
-    # Match the existing old-export username/group scope, including its
-    # cross-space grouping, so new jobs cannot receive three extra slots.
+    # 与旧导出的用户名/分组范围保持一致（含跨空间分组），
+    # 避免新任务额外获得 3 个名额。
     identity = hashlib.sha256(username.encode()).hexdigest()
     namespace = f"admission:{int(is_scene)}:{identity}"
     ExportDispatchGate.objects.get_or_create(namespace=namespace)
@@ -61,7 +61,7 @@ def active_job_count(username, is_scene=False):
 
 
 def create_job(**values):
-    """Call after API permission checks and construction of trusted snapshots."""
+    """在 API 权限校验和可信快照构造完成后调用。"""
     if not settings.ASYNC_EXPORT_SHARDED_ENABLED:
         raise ExportStateError("sharded export is disabled")
     from apps.log_search.models import AsyncTask

@@ -1,4 +1,4 @@
-"""Native single-index query binding, scoped to one planning/worker attempt."""
+"""单索引原生查询绑定，作用域限定在一次规划/执行尝试内。"""
 
 from contextlib import contextmanager
 from copy import copy, deepcopy
@@ -10,8 +10,8 @@ from django.conf import settings
 from apps.api import UnifyQueryApi
 from apps.iam import ActionEnum, ResourceEnum
 from apps.iam.handlers.drf import PlatformAwareIndexSearchPermission
-from apps.log_search.export_contracts import PlanningError
-from apps.log_search.export_query import UnifyQueryStatistics
+from apps.log_search.export.contracts import PlanningError
+from apps.log_search.export.query import UnifyQueryStatistics
 from apps.log_search.models import LogIndexSet, Space
 from apps.log_unifyquery.handler.base import UnifyQueryHandler
 from apps.utils.local import activate_request, del_local_param, get_local_param, get_request, set_local_param
@@ -46,8 +46,8 @@ def export_identity(job):
 
 class NativeQuery(UnifyQueryStatistics):
     def __init__(self, job, handler):
-        # DataAPI keeps per-call state on the object. Copy it per attempt and
-        # disable retries without mutating the API singleton used by old paths.
+        # DataAPI 会在对象上保存单次调用状态；这里按尝试复制副本并关闭重试，
+        # 避免改动旧链路共用的 API 单例。
         self.apis = {}
         for name in ("query_ts_raw", "query_ts_reference", "query_ts_raw_with_scroll"):
             api = copy(getattr(UnifyQueryApi, name))
@@ -65,7 +65,7 @@ class NativeQuery(UnifyQueryStatistics):
 
     def call(self, name, params, timeout):
         params = deepcopy(params)
-        # Celery's API preprocessor otherwise falls back to the backend admin.
+        # 否则 Celery 的 API 预处理会回退成后台管理员账号。
         params.update(bk_username=self.job.created_by, operator=self.job.created_by, no_request=True)
         return self.apis[name](params, timeout=timeout, bk_tenant_id=self.job.bk_tenant_id, request_cookies=False)
 
@@ -78,8 +78,8 @@ class NativeQuery(UnifyQueryStatistics):
 
 @contextmanager
 def native_query_factory(job):
-    # Do not inherit the old union handler's first-index desensitization or
-    # construct scene routes from only the first response's result tables.
+    # 不继承旧联合 Handler 的首索引脱敏逻辑，也不用首个响应的结果表
+    # 拼装场景路由。
     if job.query_kind != "single" or len(job.index_set_ids) != 1:
         raise PlanningError("QUERY_MODE_NOT_IMPLEMENTED")
     if job.query_kind not in settings.ASYNC_EXPORT_VERIFIED_QUERY_KINDS:
@@ -99,8 +99,8 @@ def native_query_factory(job):
     index = LogIndexSet.objects.get(pk=index_id)
     if getattr(index, "is_group", False):
         raise PlanningError("QUERY_MODE_NOT_IMPLEMENTED")
-    # Cross-space/platform routing remains gated until its frozen resource
-    # contract is implemented. Never infer scope from an arbitrary first index.
+    # 跨空间/跨平台路由在冻结资源契约实现前保持关闭，
+    # 绝不能从任意首个索引推断作用范围。
     if index.space_uid != job.space_uid or params.get("bk_biz_id") != space.bk_biz_id:
         raise PlanningError("QUERY_SCOPE_MISMATCH")
     with export_identity(job) as request:
@@ -111,8 +111,8 @@ def native_query_factory(job):
         if permission.has_permission(request, view) is False:
             raise PlanningError("QUERY_PERMISSION_DENIED")
         handler = UnifyQueryHandler(params)
-        # Changes in routing, filters or sort invalidate the frozen execution;
-        # rebuilding a fresh query must not silently change an existing Job.
+        # 路由、过滤或排序变化会使冻结的执行失效；重建查询不能
+        # 静默改变既有 Job。
         if handler.base_dict != job.query_snapshot.get("unify_query"):
             raise PlanningError("QUERY_SNAPSHOT_CHANGED")
         if "projection" in job.query_snapshot and projection_snapshot(handler) != job.query_snapshot["projection"]:
@@ -121,7 +121,7 @@ def native_query_factory(job):
 
 
 def projection_snapshot(handler):
-    """Freeze the effective projection, including privileged desensitize bypass."""
+    """冻结生效的投影配置，包含特权用户的脱敏旁路结果。"""
     return deepcopy(
         {
             "export_fields": handler.export_fields,

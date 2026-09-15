@@ -10,9 +10,9 @@ from unittest.mock import Mock, patch
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 
-from apps.log_search import export_state as state
-from apps.log_search.export_models import ExportPart
-from apps.log_search.export_worker import (
+from apps.log_search.export import state
+from apps.log_search.export.models import ExportPart
+from apps.log_search.export.worker import (
     LocalArtifactStore,
     PartError,
     RawWithScrollReader,
@@ -20,7 +20,7 @@ from apps.log_search.export_worker import (
     WorkerPolicy,
     run_part,
 )
-from apps.log_search.tests.export_fixtures import create_job
+from apps.tests.log_search.export_fixtures import create_job
 
 
 def query_with_pages(pages):
@@ -155,10 +155,10 @@ class PartWorkerTest(TestCase):
         query.close.assert_called_once()
         self.budget.release.assert_called_once()
         self.job.refresh_from_db()
-        self.assertEqual(self.job.status, "RUNNING")  # Manifest remains separate.
+        self.assertEqual(self.job.status, "RUNNING")  # Manifest 单独处理。
         self.assertEqual(self.job.actual_total, 2)
         self.execute(query)
-        self.assertEqual(query.read.call_count, 2)  # Duplicate delivery has no I/O.
+        self.assertEqual(query.read.call_count, 2)  # 重复投递不发起任何 I/O。
 
     def test_packaging_stage_is_persisted_before_compression(self):
         original_open = tarfile.open
@@ -170,7 +170,7 @@ class PartWorkerTest(TestCase):
                 observed.append((self.part.stage, self.part.processed_rows))
             return original_open(*args, **kwargs)
 
-        with patch("apps.log_search.export_worker.tarfile.open", side_effect=open_archive):
+        with patch("apps.log_search.export.worker.tarfile.open", side_effect=open_archive):
             self.execute(query_with_pages([{"list": [{"log": "one"}], "done": True}]))
         self.assertEqual(observed, [("PACKAGE", 1)])
         self.assertEqual(self.part.status, ExportPart.Status.SUCCESS)

@@ -1,12 +1,12 @@
-"""Bounded adaptive partitioning, with state and query I/O kept at the edges."""
+"""有界自适应分片；状态写入与查询 I/O 都放在边界上。"""
 
 import time
 from dataclasses import replace
 
 from django.utils import timezone
 
-from apps.log_search import export_state as state
-from apps.log_search.export_contracts import (
+from apps.log_search.export import state
+from apps.log_search.export.contracts import (
     PlannerPolicy,
     PlanningError,
     PartSpec,
@@ -15,7 +15,7 @@ from apps.log_search.export_contracts import (
     StaleExportUpdateError,
     nonnegative_integer,
 )
-from apps.log_search.export_query import Statistics, StatisticsFactory
+from apps.log_search.export.query import Statistics, StatisticsFactory
 from apps.utils.log import logger
 
 
@@ -107,8 +107,8 @@ class AdaptivePlanner:
 
         parts = []
         for lower, upper in ranges:
-            # A forced split preserves one boundary, while both children still
-            # use the ordinary adaptive refinement and merge algorithm.
+            # 局部分裂只保留一个必需的中点边界，两侧仍然走普通的
+            # 自适应细分与合并算法。
             pieces = self.range_parts(lower, upper) if total else [PartSpec(None, lower, upper, 0, 0)]
             for part in pieces:
                 previous = parts[-1] if parts and parts[-1].end_time > lower else None
@@ -142,8 +142,8 @@ def _run_planning(attempt: state.PlanningAttempt | None, statistics_factory: Sta
         return None
     try:
         policy = PlannerPolicy.for_job(attempt.job)
-        # The factory owns tenant/user context and must restore it on success,
-        # failure, cancellation and a stale planning callback alike.
+        # 工厂负责租户/用户上下文，成功、失败、取消以及规划回调已过期时
+        # 都必须恢复现场。
         attempt.heartbeat()
         started_at = time.monotonic()
         with statistics_factory(attempt.job) as statistics:
@@ -184,7 +184,7 @@ def _run_planning(attempt: state.PlanningAttempt | None, statistics_factory: Sta
         elif isinstance(exc, PlanValidationError):
             error = PlanningError("INVALID_PLAN")
         else:
-            # Do not persist/log query contents or credentials from exceptions.
+            # 不落库、不打印异常里的查询内容或凭据。
             logger.warning("export planning job=%s exception_type=%s", attempt.job.pk, type(exc).__name__)
             error = PlanningError("STATISTICS_FAILED", retryable=True)
         attempt.fail(error)

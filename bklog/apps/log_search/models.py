@@ -93,7 +93,7 @@ from apps.log_search.exceptions import (
     SourceDuplicateException,
 )
 from apps.log_search.utils import fetch_request_username
-from apps.log_search.export_models import ExportArtifact, ExportDispatchGate, ExportJob, ExportPart, ExportPlan  # noqa: F401
+from apps.log_search.export.models import ExportArtifact, ExportDispatchGate, ExportJob, ExportPart, ExportPlan  # noqa: F401
 from apps.models import (
     JsonField,
     MultiStrSplitByCommaField,
@@ -1783,7 +1783,7 @@ class AsyncTask(OperateRecordModel):
 
         new_count = 0
         if settings.ASYNC_EXPORT_SHARDED_ENABLED or settings.ASYNC_EXPORT_CONTROL_ENABLED:
-            from apps.log_search.export_admission import active_job_count
+            from apps.log_search.export.admission import active_job_count
 
             new_count = active_job_count(username, is_scene=is_scene)
         if (
@@ -1811,7 +1811,7 @@ class AsyncTask(OperateRecordModel):
             return cls.objects.create(**task_params)
 
         if settings.ASYNC_EXPORT_SHARDED_ENABLED or settings.ASYNC_EXPORT_CONTROL_ENABLED:
-            from apps.log_search.export_admission import admission_lock
+            from apps.log_search.export.admission import admission_lock
 
             with admission_lock(username, is_scene=is_scene):
                 return check_and_create_task()

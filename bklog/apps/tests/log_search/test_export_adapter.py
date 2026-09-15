@@ -8,8 +8,8 @@ from unittest.mock import Mock, patch
 from django.test import SimpleTestCase, override_settings
 
 from apps.api.modules.unify_query import _UnifyQueryApi
-from apps.log_search.export_adapter import NativeQuery, export_identity, native_query_factory
-from apps.log_search.export_contracts import PlanningError
+from apps.log_search.export.adapter import NativeQuery, export_identity, native_query_factory
+from apps.log_search.export.contracts import PlanningError
 from apps.log_unifyquery.handler.base import UnifyQueryHandler
 from apps.utils.local import activate_request, del_local_param, get_local_param, get_request, set_local_param
 
@@ -65,7 +65,7 @@ class NativeAdapterTest(SimpleTestCase):
         apis = _UnifyQueryApi()
         apis.query_ts_raw_with_scroll.data_api_retry_cls = object()
         original_retry = apis.query_ts_raw_with_scroll.data_api_retry_cls
-        with patch("apps.log_search.export_adapter.UnifyQueryApi", apis):
+        with patch("apps.log_search.export.adapter.UnifyQueryApi", apis):
             query = NativeQuery(self.job, Mock())
         native = query.apis["query_ts_raw_with_scroll"]
         self.assertIsNone(native.data_api_retry_cls)
@@ -100,7 +100,7 @@ class NativeAdapterTest(SimpleTestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with patch("apps.log_search.export_adapter.UnifyQueryApi", _UnifyQueryApi()):
+            with patch("apps.log_search.export.adapter.UnifyQueryApi", _UnifyQueryApi()):
                 query = NativeQuery(self.job, Mock())
             query.apis["query_ts_raw_with_scroll"].url = f"http://127.0.0.1:{server.server_port}/raw_with_scroll/"
             with export_identity(self.job):
@@ -143,7 +143,7 @@ class NativeAdapterTest(SimpleTestCase):
         handler = Mock(base_dict=deepcopy(self.base))
         handler._deal_query_result.side_effect = lambda response: {"origin_log_list": [{"log": "masked"}]}
         return patch.multiple(
-            "apps.log_search.export_adapter",
+            "apps.log_search.export.adapter",
             Space=Mock(objects=Mock(get=Mock(return_value=SimpleNamespace(bk_biz_id=2)))),
             LogIndexSet=Mock(objects=Mock(get=Mock(return_value=SimpleNamespace(space_uid="bkcc__2")))),
             PlatformAwareIndexSearchPermission=Mock(),
@@ -166,7 +166,7 @@ class NativeAdapterTest(SimpleTestCase):
         handler._log_desensitize = Mock(side_effect=lambda row: {**row, "message": "masked"})
         handler._add_cmdb_fields = lambda row: row
         handler._add_bcs_cluster_fields = lambda row: row
-        with patch("apps.log_search.export_adapter.UnifyQueryApi", _UnifyQueryApi()):
+        with patch("apps.log_search.export.adapter.UnifyQueryApi", _UnifyQueryApi()):
             query = NativeQuery(self.job, handler)
         response = {"list": [{"message": "secret", "unselected": "hidden"}]}
         query.raw = Mock(return_value=response)
@@ -188,7 +188,7 @@ class NativeAdapterTest(SimpleTestCase):
 
     def test_permission_denial_prevents_handler_and_transport(self):
         patches, _ = self.factory_patches()
-        with patches, patch("apps.log_search.export_adapter.PlatformAwareIndexSearchPermission") as permission:
+        with patches, patch("apps.log_search.export.adapter.PlatformAwareIndexSearchPermission") as permission:
             permission.return_value.has_permission.return_value = False
             with self.assertRaisesMessage(PlanningError, "QUERY_PERMISSION_DENIED"):
                 with native_query_factory(self.job):

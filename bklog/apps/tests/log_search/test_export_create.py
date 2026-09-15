@@ -7,12 +7,12 @@ from rest_framework.test import APIRequestFactory
 
 from apps.log_search.constants import ExportType
 from apps.log_search.exceptions import ConcurrentExportLimitException
-from apps.log_search.export_adapter import native_query_factory
-from apps.log_search.export_api import ExportConflict
-from apps.log_search.export_contracts import PlanningError
-from apps.log_search.export_create import create_export
-from apps.log_search.export_models import ExportJob
-from apps.log_search.export_serializers import ExportCreateSerializer
+from apps.log_search.export.adapter import native_query_factory
+from apps.log_search.export.api import ExportConflict
+from apps.log_search.export.contracts import PlanningError
+from apps.log_search.export.create import create_export
+from apps.log_search.export.models import ExportJob
+from apps.log_search.export.serializers import ExportCreateSerializer
 from apps.log_search.models import AsyncTask, LogIndexSet, Space
 from apps.log_search.views.export_views import ExportJobViewSet
 from apps.log_unifyquery.handler.base import UnifyQueryHandler
@@ -87,18 +87,18 @@ class CreateExportTest(TestCase):
         self.index = LogIndexSet.objects.create(index_set_id=1, space_uid="bkcc__2")
         self.mocks = {}
         patches = {
-            "apps.log_search.export_create.get_request_username": {"return_value": "alice"},
-            "apps.log_search.export_create.get_request_external_username": {"return_value": ""},
-            "apps.log_search.export_create.get_request_app_code": {"return_value": "app"},
-            "apps.log_search.export_create.get_request_tenant_id": {"return_value": "tenant"},
-            "apps.log_search.export_api.get_request_tenant_id": {"return_value": "tenant"},
-            "apps.log_search.export_api.get_request_username": {"return_value": "alice"},
-            "apps.log_search.export_api.BusinessActionPermission.has_permission": {"return_value": True},
-            "apps.log_search.export_api.IAMPermission.has_permission": {"return_value": True},
-            "apps.log_search.export_create.SearchHandler.init_time_field": {
+            "apps.log_search.export.create.get_request_username": {"return_value": "alice"},
+            "apps.log_search.export.create.get_request_external_username": {"return_value": ""},
+            "apps.log_search.export.create.get_request_app_code": {"return_value": "app"},
+            "apps.log_search.export.create.get_request_tenant_id": {"return_value": "tenant"},
+            "apps.log_search.export.api.get_request_tenant_id": {"return_value": "tenant"},
+            "apps.log_search.export.api.get_request_username": {"return_value": "alice"},
+            "apps.log_search.export.api.BusinessActionPermission.has_permission": {"return_value": True},
+            "apps.log_search.export.api.IAMPermission.has_permission": {"return_value": True},
+            "apps.log_search.export.create.SearchHandler.init_time_field": {
                 "return_value": ("timestamp", "date", "millisecond")
             },
-            "apps.log_search.export_create.UnifyQueryHandler": {"side_effect": self.handler},
+            "apps.log_search.export.create.UnifyQueryHandler": {"side_effect": self.handler},
         }
         for target, kwargs in patches.items():
             patcher = patch(target, **kwargs)
@@ -131,7 +131,7 @@ class CreateExportTest(TestCase):
         return self.last_handler
 
     def test_real_handler_builds_matching_frozen_request(self):
-        self.mocks["apps.log_search.export_create.UnifyQueryHandler"].side_effect = UnifyQueryHandler
+        self.mocks["apps.log_search.export.create.UnifyQueryHandler"].side_effect = UnifyQueryHandler
         index_info = {
             "index_set_id": 1,
             "scenario_id": "es",
@@ -158,7 +158,7 @@ class CreateExportTest(TestCase):
                 "apps.log_unifyquery.handler.base.UnifyQueryMappingHandler.get_all_fields_by_index_id",
                 return_value=([], []),
             ),
-            patch("apps.log_search.export_adapter.PlatformAwareIndexSearchPermission") as permission,
+            patch("apps.log_search.export.adapter.PlatformAwareIndexSearchPermission") as permission,
         ):
             permission.return_value.has_permission.return_value = True
             result = create_export(
@@ -195,7 +195,7 @@ class CreateExportTest(TestCase):
         first = create_export(None, inputs())
         for _ in range(2):
             AsyncTask.objects.create(created_by="alice", export_type=ExportType.ASYNC, request_param={})
-        builder = self.mocks["apps.log_search.export_create.UnifyQueryHandler"]
+        builder = self.mocks["apps.log_search.export.create.UnifyQueryHandler"]
         builder.reset_mock()
         with override_settings(ASYNC_EXPORT_PLANNER_POLICY={"max_rows": 1}):
             repeated = create_export(None, inputs())
@@ -203,7 +203,7 @@ class CreateExportTest(TestCase):
         builder.assert_not_called()
         with self.assertRaises(ExportConflict):
             create_export(None, inputs(keyword="different"))
-        self.mocks["apps.log_search.export_create.get_request_app_code"].return_value = "other"
+        self.mocks["apps.log_search.export.create.get_request_app_code"].return_value = "other"
         with self.assertRaises(ExportConflict):
             create_export(None, inputs())
 
@@ -212,7 +212,7 @@ class CreateExportTest(TestCase):
             AsyncTask.objects.create(created_by="alice", export_type=ExportType.ASYNC, request_param={})
         with self.assertRaises(ConcurrentExportLimitException):
             create_export(None, inputs())
-        self.mocks["apps.log_search.export_create.UnifyQueryHandler"].assert_not_called()
+        self.mocks["apps.log_search.export.create.UnifyQueryHandler"].assert_not_called()
         self.assertFalse(ExportJob.objects.exists())
 
     def test_quota_rechecked_after_snapshot_creation(self):
@@ -223,7 +223,7 @@ class CreateExportTest(TestCase):
                 AsyncTask.objects.create(created_by="alice", export_type=ExportType.ASYNC, request_param={})
             return original(params)
 
-        self.mocks["apps.log_search.export_create.UnifyQueryHandler"].side_effect = competing
+        self.mocks["apps.log_search.export.create.UnifyQueryHandler"].side_effect = competing
         with self.assertRaises(ConcurrentExportLimitException):
             create_export(None, inputs())
         self.assertFalse(ExportJob.objects.exists())
@@ -245,20 +245,20 @@ class CreateExportTest(TestCase):
         self.index.save(update_fields=["is_group"])
         with self.assertRaises(ValidationError):
             create_export(None, inputs())
-        self.mocks["apps.log_search.export_create.get_request_external_username"].return_value = "external"
+        self.mocks["apps.log_search.export.create.get_request_external_username"].return_value = "external"
         with self.assertRaises(PermissionDenied):
             create_export(None, inputs())
-        self.mocks["apps.log_search.export_create.UnifyQueryHandler"].assert_not_called()
+        self.mocks["apps.log_search.export.create.UnifyQueryHandler"].assert_not_called()
 
     def test_precision_and_binding_errors_do_not_leave_job(self):
-        self.mocks["apps.log_search.export_create.SearchHandler.init_time_field"].return_value = (
+        self.mocks["apps.log_search.export.create.SearchHandler.init_time_field"].return_value = (
             "time",
             "long",
             "second",
         )
         with self.assertRaises(ValidationError):
             create_export(None, inputs(start_time=1700000000001))
-        self.mocks["apps.log_search.export_create.UnifyQueryHandler"].side_effect = RuntimeError("metadata failure")
+        self.mocks["apps.log_search.export.create.UnifyQueryHandler"].side_effect = RuntimeError("metadata failure")
         previous = get_request(peaceful=True)
         with self.assertRaises(RuntimeError):
             create_export(None, inputs())
@@ -269,8 +269,8 @@ class CreateExportTest(TestCase):
         result = create_export(None, inputs())
         job = ExportJob.objects.get(pk=result["job_id"])
         with (
-            patch("apps.log_search.export_adapter.UnifyQueryHandler", side_effect=self.handler),
-            patch("apps.log_search.export_adapter.PlatformAwareIndexSearchPermission") as permission,
+            patch("apps.log_search.export.adapter.UnifyQueryHandler", side_effect=self.handler),
+            patch("apps.log_search.export.adapter.PlatformAwareIndexSearchPermission") as permission,
         ):
             permission.return_value.has_permission.return_value = True
             with native_query_factory(job) as query:
@@ -285,8 +285,8 @@ class CreateExportTest(TestCase):
             result = create_export(None, inputs())
         job = ExportJob.objects.get(pk=result["job_id"])
         with (
-            patch("apps.log_search.export_adapter.UnifyQueryHandler", side_effect=self.handler),
-            patch("apps.log_search.export_adapter.PlatformAwareIndexSearchPermission") as permission,
+            patch("apps.log_search.export.adapter.UnifyQueryHandler", side_effect=self.handler),
+            patch("apps.log_search.export.adapter.PlatformAwareIndexSearchPermission") as permission,
         ):
             permission.return_value.has_permission.return_value = True
             with native_query_factory(job) as query:

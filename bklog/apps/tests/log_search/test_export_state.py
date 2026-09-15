@@ -4,8 +4,8 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from apps.log_search.export_models import ExportJob, ExportPart
-from apps.log_search.export_state import (
+from apps.log_search.export.models import ExportJob, ExportPart
+from apps.log_search.export.state import (
     ExportStateError,
     InvalidTransitionError,
     PartSpec,
@@ -274,14 +274,14 @@ class ExportStateTest(TestCase):
         job = self.create_job()
         part = self.activate_plan(job).parts.get()
         now = timezone.now()
-        with patch("apps.log_search.export_state._now", return_value=now):
+        with patch("apps.log_search.export.state._now", return_value=now):
             with self.assertRaises(ExportStateError):
                 dispatch_part(part.pk, lease_id="lease", task_id="task", lease_until=now)
         part.refresh_from_db()
         self.assertEqual(part.status, ExportPart.Status.WAITING)
         self.assertEqual(part.dispatch_generation, 0)
         dispatched = dispatch_part(part.pk, lease_id="lease", task_id="task", lease_until=now + timedelta(minutes=1))
-        with patch("apps.log_search.export_state._now", return_value=dispatched.lease_until):
+        with patch("apps.log_search.export.state._now", return_value=dispatched.lease_until):
             with self.assertRaises(StaleExportUpdateError):
                 claim_part(part.pk, generation=1, lease_id="lease", worker_id="worker")
             with self.assertRaises(StaleExportUpdateError):
@@ -293,7 +293,7 @@ class ExportStateTest(TestCase):
     def test_expired_worker_cannot_revive_lease_upload_or_commit(self):
         job = self.create_job()
         part, lease_id, generation = self.dispatch_and_claim(self.activate_plan(job).parts.get())
-        with patch("apps.log_search.export_state._now", return_value=part.lease_until):
+        with patch("apps.log_search.export.state._now", return_value=part.lease_until):
             with self.assertRaises(StaleExportUpdateError):
                 heartbeat_part(
                     part.pk,
@@ -305,7 +305,7 @@ class ExportStateTest(TestCase):
             with self.assertRaises(StaleExportUpdateError):
                 begin_part_upload(part.pk, generation=generation, lease_id=lease_id)
         begin_part_upload(part.pk, generation=generation, lease_id=lease_id)
-        with patch("apps.log_search.export_state._now", return_value=part.lease_until):
+        with patch("apps.log_search.export.state._now", return_value=part.lease_until):
             with self.assertRaises(StaleExportUpdateError):
                 complete_part(
                     part.pk,
@@ -376,7 +376,7 @@ class ExportStateTest(TestCase):
         self.assertEqual(again.state_version, canceled.state_version)
         part.refresh_from_db()
         self.assertEqual(part.lease_id, lease_id)
-        # The worker still owns its budget while the already-started I/O exits.
+        # 已开始的 I/O 退出之前，Worker 仍然持有它的预算。
         heartbeat_part(
             part.pk,
             generation=generation,
@@ -408,7 +408,7 @@ class ExportStateTest(TestCase):
         part, lease, generation = self.dispatch_and_claim(plan.parts.get())
         self.complete_claimed_part(part, lease, generation)
         completed_at = timezone.now() + timedelta(hours=2)
-        with patch("apps.log_search.export_state._now", return_value=completed_at):
+        with patch("apps.log_search.export.state._now", return_value=completed_at):
             finalized = finalize_job_success(
                 job.pk,
                 plan_version=1,

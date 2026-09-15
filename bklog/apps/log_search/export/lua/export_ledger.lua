@@ -1,5 +1,5 @@
--- A single hash-slot key holds the entire bounded in-flight ledger. Leases
--- NEVER expire entries automatically: TTL is fencing, not proof of I/O exit.
+-- 单个 hash-slot key 保存整个有界在途账本。
+-- 租约条目绝不自动过期：TTL 只用于隔离，不能作为 I/O 已退出的证据。
 local key = KEYS[1]
 local operation = ARGV[1]
 if operation == 'rebuild' then

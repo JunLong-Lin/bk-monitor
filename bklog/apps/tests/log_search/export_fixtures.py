@@ -1,6 +1,6 @@
 from contextlib import AbstractContextManager
 
-from apps.log_search.export_models import ExportJob
+from apps.log_search.export.models import ExportJob
 
 
 def create_job(**extra):

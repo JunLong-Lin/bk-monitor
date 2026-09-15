@@ -1,22 +1,22 @@
-"""Opt-in control tasks; old export queues and entry points are unchanged."""
+"""按开关启用的控制任务；旧导出队列与入口保持不变。"""
 
 from blueapps.core.celery.celery import app
 from django.conf import settings
 from django.utils.module_loading import import_string
 from django_redis import get_redis_connection
 
-from apps.log_search import export_admission
-from apps.log_search.export_contracts import ExportStateError
-from apps.log_search.export_coordinator import BudgetUnavailable, Coordinator, RedisBudget
-from apps.log_search.export_planner import plan_job, replan_failed_part
-from apps.log_search.export_worker import run_part
-from apps.log_search.export_finalize import cleanup_export, finalize_export
-from apps.log_search.export_files import cleanup_temporary_files
+from apps.log_search.export import admission
+from apps.log_search.export.contracts import ExportStateError
+from apps.log_search.export.coordinator import BudgetUnavailable, Coordinator, RedisBudget
+from apps.log_search.export.planner import plan_job, replan_failed_part
+from apps.log_search.export.worker import run_part
+from apps.log_search.export.finalize import cleanup_export, finalize_export
+from apps.log_search.export.files import cleanup_temporary_files
 from apps.utils.log import logger
 
 
 def publish_part(part):
-    # Missing P4 integration is a configuration error, never a queued unknown task.
+    # 缺少 P4 集成属于配置错误，绝不能投递一个未知任务到队列。
     if not settings.ASYNC_EXPORT_PART_TASK:
         raise BudgetUnavailable("Part worker task is not configured")
     app.send_task(
@@ -37,7 +37,7 @@ def adapter_factory():
 
 def check_runtime_configuration():
     try:
-        export_admission.validate_runtime_configuration()
+        admission.validate_runtime_configuration()
     except ExportStateError as error:
         raise BudgetUnavailable(str(error)) from error
 
@@ -90,10 +90,10 @@ def cleanup_sharded_export(job_id):
 
 @app.task(ignore_result=True, queue="sharded_async_export_control")
 def coordinate_sharded_exports():
-    """Install a periodic schedule only after enabling and configuring the route.
+    """启用并配置好链路之后才安装周期调度。
 
-    Repeated scans repair missing planning, dispatch, split and finalization
-    messages. Workers must use the generation/lease headers, not just part_id.
+    重复扫描用于补回缺失的规划、投递、拆分和收尾消息；Worker 必须使用
+    generation/lease 请求头，不能只依赖 part_id。
     """
     if not settings.ASYNC_EXPORT_CONTROL_ENABLED:
         return

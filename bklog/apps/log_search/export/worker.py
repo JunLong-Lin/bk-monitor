@@ -1,4 +1,4 @@
-"""One leased Part attempt: explicit EOF, bounded JSONL and verified tar.gz."""
+"""一次持有租约的 Part 执行：显式 EOF、有界 JSONL 与校验过的 tar.gz。"""
 
 import hashlib
 import gzip
@@ -14,12 +14,12 @@ from pathlib import Path
 from django.conf import settings
 from django.utils import timezone
 
-from apps.log_search import export_state as state
-from apps.log_search.export_contracts import ExportStateError, PlanningError
-from apps.log_search.export_coordinator import BudgetUnavailable, renew_worker_lease
-from apps.log_search.export_models import ExportJob
-from apps.log_search.export_query import encode_export_row
-from apps.log_search.export_files import export_temporary_directory
+from apps.log_search.export import state
+from apps.log_search.export.contracts import ExportStateError, PlanningError
+from apps.log_search.export.coordinator import BudgetUnavailable, renew_worker_lease
+from apps.log_search.export.models import ExportJob
+from apps.log_search.export.query import encode_export_row
+from apps.log_search.export.files import export_temporary_directory
 from apps.utils.log import logger
 
 
@@ -30,7 +30,7 @@ class PartError(Exception):
 
 
 class UnconfirmedQueryExit(PartError):
-    """A failed HTTP call does not prove the remote query has stopped."""
+    """HTTP 调用失败不能证明远端查询已经停止。"""
 
 
 @dataclass(frozen=True)
@@ -114,7 +114,7 @@ class AttemptGuard:
             lease_until=timezone.now() + timedelta(seconds=lease_seconds),
             processed_rows=self.rows,
         )
-        # Leave headroom for observing the response before the lease expires.
+        # 留出余量，确保租约到期前还能观察到响应。
         return min(remaining, lease_seconds / 2)
 
 
@@ -143,7 +143,8 @@ class CheckedFile:
 def digest_file(path, guard):
     digest = hashlib.sha256()
     with path.open("rb") as stream:
-        while block := CheckedFile(stream, guard).read(1024 * 1024):
+        checked = CheckedFile(stream, guard)
+        while block := checked.read(1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
 
@@ -194,7 +195,7 @@ def package_part(query, part, directory, policy, guard, *, on_packaging=None):
         info = tarfile.TarInfo(member_name)
         info.size, info.mode, info.mtime = size, 0o600, 0
         bundle.addfile(info, CheckedFile(stream, guard))
-    # Read the archive back; success requires the exact complete JSONL bytes.
+    # 回读压缩包；必须与完整的 JSONL 字节完全一致才算成功。
     with tarfile.open(archive, "r|gz") as bundle:
         member = bundle.next()
         if member is None or not member.isfile() or member.name != member_name or member.size != size:
@@ -211,7 +212,7 @@ def package_part(query, part, directory, policy, guard, *, on_packaging=None):
 
 
 class LocalArtifactStore:
-    """Explicit development sink. Not a substitute for COS or shared storage."""
+    """仅用于本地开发的产物落盘，不能替代 COS 或共享存储。"""
 
     def __init__(self, root):
         self.root = Path(root).resolve()
@@ -220,7 +221,7 @@ class LocalArtifactStore:
         key = f"{part.plan.job_id}/{part.plan.plan_version}/{part.pk}/{artifact.checksum}.tar.gz"
         target = self.root / key
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Link a fully copied, verified file atomically; never overwrite a winner.
+        # 先完整复制并校验，再原子链接；绝不覆盖已有的获胜对象。
         with tempfile.NamedTemporaryFile(dir=target.parent) as temporary, artifact.path.open("rb") as source:
             while block := CheckedFile(source, guard).read(1024 * 1024):
                 temporary.write(block)
@@ -249,7 +250,7 @@ def run_part(part_id, *, generation, lease_id, query_factory, budget, store, pol
     try:
         part = state.claim_part(part_id, **credentials, worker_id=f"{socket.gethostname()}:{os.getpid()}")
     except ExportStateError:
-        return  # Duplicate, canceled or stale delivery never starts query I/O.
+        return  # 重复、已取消或过期的投递不会发起任何查询 I/O。
     guard = AttemptGuard(part, budget, policy, credentials)
     try:
         guard()
@@ -277,8 +278,8 @@ def run_part(part_id, *, generation, lease_id, query_factory, budget, store, pol
                 checksum=artifact.checksum,
             )
     except UnconfirmedQueryExit as error:
-        # HTTP timeout/transport failure is not evidence that remote I/O ended.
-        # Keep the ledger occupied for the conservative recovery mechanism.
+        # HTTP 超时/传输失败不能证明远端 I/O 已结束，
+        # 因此继续占用账本，交给保守的恢复机制处理。
         state.note_unconfirmed_part(part.pk, **credentials, error_code=error.code)
         return
     except Exception as error:

@@ -1,4 +1,4 @@
-"""Explicit new-protocol inputs; internal snapshots are never client input."""
+"""新协议的显式入参；内部快照永远不作为客户端输入。"""
 
 import pytz
 from rest_framework import serializers
@@ -28,8 +28,8 @@ class ExportCreateSerializer(StrictSerializer):
     space_uid = serializers.CharField(max_length=256)
     index_set_id = serializers.IntegerField(min_value=1)
     request_id = serializers.CharField(max_length=128, required=False, default=None)
-    # Unlike the legacy endpoint, these are explicit epoch milliseconds and
-    # [start, end) boundaries. Relative periods and implicit unit guessing fail.
+    # 与旧接口不同，这里只接受明确的 epoch 毫秒和左闭右开区间；
+    # 相对时间与隐式单位推断一律拒绝。
     start_time = serializers.IntegerField(min_value=0, max_value=253402300799000)
     end_time = serializers.IntegerField(min_value=1, max_value=253402300799000)
     time_zone = serializers.CharField(default="UTC")

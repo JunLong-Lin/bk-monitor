@@ -1,4 +1,4 @@
-"""UnifyQuery statistics over frozen routes and an authorized bound transport."""
+"""基于冻结路由与已授权绑定通道的 UnifyQuery 统计能力。"""
 
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -7,7 +7,7 @@ from typing import Protocol
 import ujson
 from django.conf import settings
 
-from apps.log_search.export_contracts import PlanningError, nonnegative_integer
+from apps.log_search.export.contracts import PlanningError, nonnegative_integer
 
 
 class Statistics(Protocol):
@@ -17,23 +17,22 @@ class Statistics(Protocol):
 
 
 class StatisticsFactory(Protocol):
-    """Scope authorization/resources to the entire planning attempt."""
+    """把授权与资源绑定到整次规划尝试的生命周期。"""
 
     def __call__(self, job) -> AbstractContextManager[Statistics]: ...
 
 
 def encode_export_row(row):
-    """Shared JSONL encoding for projected/desensitized sample and worker rows."""
+    """采样与 Worker 共用的 JSONL 编码（已投影/脱敏）。"""
     return (ujson.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 class UnifyQueryStatistics:
-    """Use frozen query routes and bound, authorized UnifyQuery primitives.
+    """使用冻结的查询路由与已授权的 UnifyQuery 原语。
 
-    raw/reference must accept (params, timeout=...) and preserve tenant/user
-    context and scene permission checks. project is the same batch conversion
-    used by the Part reader. The factory owns restoring/clearing that context.
-    No network capability is assumed: each mode requires deployment validation.
+    raw/reference 必须接受 (params, timeout=...) 并保持租户/用户上下文与场景
+    权限校验；project 与 Part Reader 使用同一套批次转换逻辑。上下文的恢复与
+    清理由工厂负责。这里不假设任何网络能力，每种模式都要经过部署验证。
     """
 
     def __init__(self, job, *, raw, reference, project):
@@ -76,7 +75,7 @@ class UnifyQueryStatistics:
 
     def histogram(self, start, end, interval, *, timeout):
         params = self.request(start, end)
-        # Preserve every reference and the union merge expression.
+        # 保留每个 reference 以及联合查询的 merge 表达式。
         milliseconds = interval * 1000 // self.units
         if milliseconds * self.units != interval * 1000 or milliseconds < 1:
             raise PlanningError("UNSUPPORTED_HISTOGRAM_PRECISION")
@@ -91,7 +90,7 @@ class UnifyQueryStatistics:
             raise PlanningError("INVALID_STATISTICS")
         buckets = {}
         for timestamp, count in series[0]["values"] if series else []:
-            # Existing ts/reference responses expose epoch milliseconds.
+            # 现有 ts/reference 响应给出的时间戳是 epoch 毫秒。
             if not isinstance(timestamp, int) or timestamp * self.units % 1000:
                 raise PlanningError("INVALID_STATISTICS")
             key = timestamp * self.units // 1000

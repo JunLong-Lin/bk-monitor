@@ -1,11 +1,10 @@
-"""Export lifecycle writes, serialized in Job -> Part order.
+"""导出生命周期写操作，按 Job -> Part 的顺序串行化。
 
-Planners, coordinators and workers use these operations rather than updating
-lifecycle columns themselves. Planning ownership and worker ownership are
-separate: planning retries never consume a Part's execution attempts.
+Planner、Coordinator 和 Worker 都通过这里的操作写入，而不是各自更新生命周期字段。
+规划所有权与 Worker 所有权相互独立：规划重试不会消耗 Part 的执行次数。
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -14,7 +13,7 @@ from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 
-from apps.log_search.export_contracts import (
+from apps.log_search.export.contracts import (
     ExportStateError,
     InvalidTransitionError,
     PartSpec,
@@ -25,7 +24,7 @@ from apps.log_search.export_contracts import (
     SPLITTABLE_PART_ERROR_CODES,
     StaleExportUpdateError,
 )
-from apps.log_search.export_models import ExportJob, ExportPart, ExportPlan
+from apps.log_search.export.models import ExportJob, ExportPart, ExportPlan
 
 
 JOB_TRANSITIONS = {
@@ -64,7 +63,8 @@ def _ensure_current_part(part, plan, job):
         raise StaleExportUpdateError(f"Part {part.pk} is not a current active leaf")
 
 
-def _ensure_worker(part, generation, lease_id, statuses, *, live=True):
+def _ensure_worker_credential(part, generation, lease_id, statuses):
+    """只校验当前投递代次与所有者，不校验租约是否过期。"""
     if (
         part.status not in statuses
         or part.dispatch_generation != generation
@@ -72,7 +72,11 @@ def _ensure_worker(part, generation, lease_id, statuses, *, live=True):
         or part.lease_id != lease_id
     ):
         raise StaleExportUpdateError(f"Part {part.pk}: stale worker credential")
-    if live and (part.lease_until is None or part.lease_until <= _now()):
+
+
+def _ensure_live_worker(part, generation, lease_id, statuses):
+    _ensure_worker_credential(part, generation, lease_id, statuses)
+    if part.lease_until is None or part.lease_until <= _now():
         raise StaleExportUpdateError(f"Part {part.pk}: lease expired")
 
 
@@ -82,9 +86,9 @@ def _ensure_running_job(job):
 
 
 def _partition(parts, *, start, end, tick):
-    """Validate the same range/precision contract for initial and child leaves."""
-    specs = sorted((p if isinstance(p, PartSpec) else PartSpec(**p) for p in parts), key=lambda p: p.start_time)
-    if not specs or type(tick) is not int or tick < 1:
+    """初始分片与子分片使用同一套范围与精度校验。"""
+    specs = sorted(parts, key=lambda p: p.start_time)
+    if not specs or any(not isinstance(p, PartSpec) for p in specs) or type(tick) is not int or tick < 1:
         raise PlanValidationError("a partition requires leaves and a positive time tick")
     cursor = start
     for part in specs:
@@ -129,7 +133,7 @@ def begin_planning(job_id):
 
 @dataclass(frozen=True)
 class PlanningAttempt:
-    """An immutable credential shared by initial planning and local splitting."""
+    """初始规划与局部分裂共用的不可变凭据。"""
 
     job: ExportJob
     record_id: int
@@ -139,7 +143,7 @@ class PlanningAttempt:
     part: ExportPart | None = None
 
     def _locked_record(self):
-        # Called only by state operations within transaction.atomic().
+        # 只允许状态操作在 transaction.atomic() 内调用。
         if self.part is not None:
             record, plan, job = _get_locked_part(self.record_id)
             _ensure_current_part(record, plan, job)
@@ -181,7 +185,7 @@ class PlanningAttempt:
                     planning_lease_until=None,
                     next_planning_at=_now() + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_RETRY_SECONDS),
                 )
-                # Preserve a failed Part's execution classification for the scanner.
+                # 保留失败 Part 的执行错误分类，供扫描器判断。
                 if self.part is None:
                     changes["error_code"] = error.code
                 _save(record, **changes)
@@ -200,7 +204,7 @@ def claim_planning(*, job_id: int | None = None, part_id: int | None = None) -> 
             record = job = ExportJob.objects.select_for_update().get(pk=job_id)
             if job.status not in {ExportJob.Status.PENDING, ExportJob.Status.PLANNING}:
                 return None
-        now = _now()  # Take time after waiting for the lock, not before.
+        now = _now()  # 取得锁之后再取时间，不能在等待锁之前取。
         if record.planning_lease_until and record.planning_lease_until > now:
             return None
         if record.next_planning_at and record.next_planning_at > now:
@@ -238,7 +242,7 @@ def persist_plan(
     target_rows,
     target_bytes,
     histogram_interval,
-    parts: Iterable[PartSpec | Mapping],
+    parts: Iterable[PartSpec],
     planning_input=None,
     statistics_at=None,
     max_leaf_parts=None,
@@ -355,10 +359,10 @@ def mark_part_published(part_id, *, generation, published_at=None):
 
 
 def release_dispatch(part_id, *, generation, lease_id, error_code="DISPATCH_FAILED", error_detail=""):
-    """Only use when publication certainly failed or an unclaimed lease expired."""
+    """仅在确认发布失败，或未被领取的租约已过期时使用。"""
     with transaction.atomic():
         part, _, _ = _get_locked_part(part_id)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.DISPATCHED}, live=False)
+        _ensure_worker_credential(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
         return _save(
             part,
             status=ExportPart.Status.WAITING,
@@ -377,7 +381,7 @@ def replay_dispatched_part(part_id, *, generation, lease_id):
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
+        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
         return part
 
 
@@ -388,7 +392,7 @@ def claim_part(part_id, *, generation, lease_id, worker_id):
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
+        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
         if part.attempts >= settings.ASYNC_EXPORT_MAX_ATTEMPTS:
             raise RetryLimitExceededError("Part execution-attempt budget exhausted")
         now = _now()
@@ -405,13 +409,13 @@ def claim_part(part_id, *, generation, lease_id, worker_id):
 
 
 def heartbeat_part(part_id, *, generation, lease_id, lease_until, processed_rows=None):
-    """Terminal Jobs keep ownership until their already-started I/O exits."""
+    """终态 Job 会保留所有权，直到已开始的 I/O 退出为止。"""
     if processed_rows is not None and (type(processed_rows) is not int or processed_rows < 0):
         raise ExportStateError("processed_rows must be a nonnegative integer")
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
+        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
         if lease_until <= _now() or lease_until < part.lease_until:
             raise ExportStateError("heartbeat must not shorten or expire the lease")
         changes = dict(lease_until=lease_until, heartbeat_at=_now())
@@ -425,7 +429,7 @@ def begin_part_package(part_id, *, generation, lease_id):
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.RUNNING})
+        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.RUNNING})
         return _save(part, stage=ExportJob.Stage.PACKAGE, heartbeat_at=_now())
 
 
@@ -434,32 +438,31 @@ def begin_part_upload(part_id, *, generation, lease_id):
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.RUNNING})
+        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.RUNNING})
         return _save(part, status=ExportPart.Status.UPLOADING, stage=ExportJob.Stage.UPLOAD, heartbeat_at=_now())
 
 
 def note_unconfirmed_part(part_id, *, generation, lease_id, error_code):
-    """Record uncertain remote I/O without releasing ownership or capacity."""
+    """记录结果不确定的远端 I/O，不释放所有权与容量。"""
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING}, live=False)
+        _ensure_worker_credential(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
         return _save(part, error_code=error_code, error_detail="Remote I/O exit requires verification")
 
 
 def retry_part(part_id, *, generation, lease_id, error_code, error_detail, next_retry_at=None):
-    """Record safely ended I/O. TTL expiration alone is not evidence of exit."""
+    """记录已安全结束的 I/O；仅凭 TTL 到期不能作为退出的证据。"""
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING}, live=False)
+        _ensure_worker_credential(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
         if job.status in {ExportJob.Status.CANCELED, ExportJob.Status.FAILED}:
             target = ExportPart.Status.CANCELED
         else:
             _ensure_running_job(job)
-            # Crossing the hard byte budget is deterministic for this fixed
-            # range. Re-running the same export cannot make it safer; hand it
-            # to the local split planner immediately.
+            # 对固定的时间范围而言，超过硬性字节预算是确定性的，重跑同样的
+            # 导出不会更安全，因此直接交给局部拆分规划。
             target = (
                 ExportPart.Status.FAILED
                 if error_code in SPLITTABLE_PART_ERROR_CODES or part.attempts >= settings.ASYNC_EXPORT_MAX_ATTEMPTS
@@ -490,7 +493,7 @@ def complete_part(part_id, *, generation, lease_id, actual_rows, actual_bytes, c
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_worker(part, generation, lease_id, {ExportPart.Status.UPLOADING})
+        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.UPLOADING})
         _save(
             part,
             status=ExportPart.Status.SUCCESS,
@@ -519,7 +522,7 @@ def complete_part(part_id, *, generation, lease_id, actual_rows, actual_bytes, c
 
 
 def split_part(
-    part_id: int, *, attempt: PlanningAttempt, children: Iterable[PartSpec | Mapping], max_leaf_parts=None
+    part_id: int, *, attempt: PlanningAttempt, children: Iterable[PartSpec], max_leaf_parts=None
 ) -> list[ExportPart]:
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
@@ -562,20 +565,20 @@ def split_part(
             planning_lease_until=None,
             next_planning_at=None,
         )
-        created = ExportPart.objects.bulk_create(rows)
+        ExportPart.objects.bulk_create(rows)
         _save(plan, part_count=count)
         _save(job, state_version=job.state_version + 1)
-        return list(created)
+        # MySQL 的 bulk_create 不会回填自增主键，因此重新读取子分片，
+        # 不能依赖内存中的实例。
+        return list(ExportPart.objects.filter(plan=plan, parent=part).order_by("part_no"))
 
 
-def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_checksum, expected_state_version=None):
+def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_checksum):
     if not manifest_object_key or not manifest_checksum:
         raise ExportStateError("manifest object and checksum are required")
     with transaction.atomic():
         job = ExportJob.objects.select_for_update().get(pk=job_id)
         _ensure_job_transition(job, ExportJob.Status.SUCCESS)
-        if expected_state_version is not None and job.state_version != expected_state_version:
-            raise StaleExportUpdateError("Job changed during finalization")
         if job.current_plan_version != plan_version:
             raise StaleExportUpdateError("plan version is no longer current")
         plan = ExportPlan.objects.get(job=job, plan_version=plan_version, status=ExportPlan.Status.READY)
@@ -644,34 +647,25 @@ def cancel_job(job_id):
 
 
 def recover_expired_part(candidate):
-    """The caller has established safe exit; recheck its observed credential."""
+    """回收未被任何 Worker 领取的过期投递。"""
     with transaction.atomic():
         part, _, _ = _get_locked_part(candidate.pk)
         fields = ("status", "dispatch_generation", "lease_id", "lease_until")
         if any(getattr(part, field) != getattr(candidate, field) for field in fields):
             return False
-        if part.status == ExportPart.Status.DISPATCHED:
-            release_dispatch(
-                part.pk,
-                generation=part.dispatch_generation,
-                lease_id=part.lease_id,
-                error_code="DISPATCH_LEASE_EXPIRED",
-            )
-        elif part.status in {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING}:
-            retry_part(
-                part.pk,
-                generation=part.dispatch_generation,
-                lease_id=part.lease_id,
-                error_code="WORKER_STOPPED",
-                error_detail="",
-            )
-        else:
+        if part.status != ExportPart.Status.DISPATCHED:
             return False
+        release_dispatch(
+            part.pk,
+            generation=part.dispatch_generation,
+            lease_id=part.lease_id,
+            error_code="DISPATCH_LEASE_EXPIRED",
+        )
         return True
 
 
 def fail_exhausted_part(part_id):
-    """A recovery scan is only a hint; validate the failed leaf under the Job lock."""
+    """恢复扫描只是提示，必须在 Job 锁内复核这个失败的叶子。"""
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         if (
@@ -687,7 +681,7 @@ def fail_exhausted_part(part_id):
 
 
 def set_parallelism(job_id, parallelism):
-    """The API verifies creator authorization before calling this operation."""
+    """调用前由 API 校验创建者权限。"""
     if type(parallelism) is not int or not 1 <= parallelism <= 8:
         raise ExportStateError("parallelism must be between 1 and 8")
     with transaction.atomic():

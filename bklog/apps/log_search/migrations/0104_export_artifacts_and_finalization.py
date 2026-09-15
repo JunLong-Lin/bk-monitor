@@ -34,12 +34,7 @@ class Migration(migrations.Migration):
                 (
                     "status",
                     models.CharField(
-                        choices=[
-                            ("UPLOADING", "Uploading"),
-                            ("READY", "Ready"),
-                            ("DELETING", "Deleting"),
-                            ("DELETED", "Deleted"),
-                        ],
+                        choices=[("UPLOADING", "Uploading"), ("READY", "Ready")],
                         default="UPLOADING",
                         max_length=16,
                     ),

@@ -1,4 +1,4 @@
-"""Fair dispatch, fail-closed Redis budgets, durable broker replay and recovery."""
+"""公平投递、失败即关闭的 Redis 预算、可重放的消息发布与故障恢复。"""
 
 import hashlib
 import json
@@ -13,20 +13,20 @@ from django.db import transaction
 from django.db.models import Count, Exists, F, OuterRef, Q
 from django.utils import timezone
 
-from apps.log_search.export_models import ExportDispatchGate, ExportJob, ExportPart, ExportPlan
-from apps.log_search import export_state as state
-from apps.log_search.export_contracts import SPLITTABLE_PART_ERROR_CODES
+from apps.log_search.export.models import ExportDispatchGate, ExportJob, ExportPart, ExportPlan
+from apps.log_search.export import state
+from apps.log_search.export.contracts import SPLITTABLE_PART_ERROR_CODES
 
 
 INFLIGHT = (ExportPart.Status.DISPATCHED, ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING)
 
 
 class BudgetUnavailable(Exception):
-    """Redis state cannot safely authorize any new work."""
+    """Redis 状态无法安全授权任何新工作。"""
 
 
 class PublishNotSent(Exception):
-    """Publisher guarantees no delivery was submitted; other failures are uncertain."""
+    """发布方保证消息未提交；其他异常都视为结果不确定。"""
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class Limits:
 
 
 def dimensions(job, oversized):
-    # Do not substitute scene 0, an alias or only the first union resource.
+    # 不能用场景虚拟索引 0、别名，也不能只取联合查询的第一个资源。
     resources = job.resolved_resource_ids
     if not isinstance(resources, list) or not resources or any(not isinstance(r, str) or not r for r in resources):
         raise BudgetUnavailable("complete canonical resource IDs are required")
@@ -123,13 +123,13 @@ class Coordinator:
             self.namespace if phase is None else f"scan:{hashlib.sha256(self.namespace.encode()).hexdigest()}:{phase}"
         )
         ExportDispatchGate.objects.get_or_create(namespace=namespace)
-        # Durable atomic blocks reject a caller's enclosing transaction, so a
-        # returned dispatch is committed before deliver can publish it.
+        # durable 事务块不接受外层事务，因此返回的投递记录在 deliver 发布前
+        # 一定已经提交。
         with transaction.atomic(durable=True):
             yield ExportDispatchGate.objects.select_for_update().get(pk=namespace)
 
     def reconcile(self):
-        """Keep expired and terminal-Job I/O in the reconstructed budget."""
+        """重建预算时保留过期租约与终态 Job 的在途 I/O。"""
         with self.gate():
             return self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
 
@@ -137,8 +137,8 @@ class Coordinator:
         if self.limits.global_limit <= 0 or self.limits.lease_seconds <= 0:
             return None
         with self.gate() as gate:
-            # DB is authoritative. A crash before DB commit leaves only an
-            # orphan Redis reservation; no message was sent, so rebuild drops it.
+            # 以数据库为准：提交前崩溃只会留下 Redis 孤儿预留，且没有发出
+            # 任何消息，重建时会被丢弃。
             epoch = self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
             jobs = ExportJob.objects.filter(status__in=[ExportJob.Status.READY, ExportJob.Status.RUNNING])
             limit = settings.ASYNC_EXPORT_SCAN_LIMIT
@@ -180,7 +180,7 @@ class Coordinator:
         try:
             self.publish(current)
         except PublishNotSent:
-            # Serialize against a fast worker claim and against ledger rebuild.
+            # 与 Worker 的快速领取和账本重建互斥。
             with self.gate():
                 try:
                     state.release_dispatch(part.pk, generation=part.dispatch_generation, lease_id=part.lease_id)
@@ -189,12 +189,12 @@ class Coordinator:
                 self.budget.release(part.pk, part.dispatch_generation, part.lease_id)
             return "not_sent"
         except Exception:
-            # Broker timeout/disconnect is NOT proof of non-delivery.
+            # broker 超时/断连不能证明消息未投递。
             return "uncertain"
         try:
             state.mark_part_published(part.pk, generation=part.dispatch_generation)
         except state.ExportStateError:
-            pass  # Worker may already have failed/retried this generation.
+            pass  # Worker 可能已经失败或重试了这一代。
         return "published"
 
     def tick(self, max_dispatches=100):
@@ -206,7 +206,7 @@ class Coordinator:
             outcome = self.deliver(part)
             sent.append((part.pk, outcome))
             if outcome in {"uncertain", "not_sent"}:
-                break  # Avoid a busy loop against an unavailable broker.
+                break  # 避免 broker 不可用时空转。
         return sent
 
     @staticmethod
@@ -221,8 +221,8 @@ class Coordinator:
         return identifiers
 
     def _batch(self, queryset, phase, limit):
-        # Every bounded scan has its own durable cursor. An unresponsive first
-        # page cannot indefinitely hide later recovery or finalization work.
+        # 每类有界扫描都有独立的持久化游标，首页长期不响应也不会永久
+        # 遮住后面的恢复或收尾工作。
         with self.gate(phase) as cursor:
             identifiers = self._round_robin_ids(queryset, cursor.cursor, limit)
             if identifiers:
@@ -240,14 +240,14 @@ class Coordinator:
         )
         return [(part.pk, self.deliver(part)) for part in parts]
 
-    def recover_expired(self, confirmed_stopped=lambda part: False, limit=100):
-        """A proof provider must cover remote I/O, not merely worker heartbeat."""
+    def recover_expired(self, limit=100):
+        """只回收未被领取的过期投递；运行中的 I/O 保留其预留。"""
         retained = []
         expired = ExportPart.objects.filter(status__in=INFLIGHT).filter(
             Q(lease_until__lte=timezone.now()) | Q(lease_until__isnull=True)
         )
         for candidate in self._batch(expired, "expired", limit):
-            if candidate.status != ExportPart.Status.DISPATCHED and not confirmed_stopped(candidate):
+            if candidate.status != ExportPart.Status.DISPATCHED:
                 retained.append(candidate.pk)
                 continue
             with self.gate():
@@ -302,12 +302,12 @@ class Coordinator:
     def cleanup_jobs(self, limit=100):
         jobs = ExportJob.objects.filter(
             status__in=[ExportJob.Status.SUCCESS, ExportJob.Status.FAILED, ExportJob.Status.CANCELED],
-            artifacts__status__in=["READY", "DELETING"],
+            artifacts__status="READY",
         ).distinct()
         return [job.pk for job in self._batch(jobs, "artifact_cleanup", limit)]
 
     def control_work(self, limit=100, *, finalize=False):
-        # Settle exhausted failures before granting more work for those Jobs.
+        # 先结算已耗尽的失败，再为这些 Job 授权新工作。
         for part in self.failed_parts(limit):
             if part.error_code in SPLITTABLE_PART_ERROR_CODES:
                 yield "split", part.pk
@@ -321,7 +321,7 @@ class Coordinator:
 
 
 def renew_worker_lease(budget, part_id, *, generation, lease_id, lease_until, processed_rows=None):
-    """Redis failure denies a new DB heartbeat; never revive a lost owner."""
+    """Redis 失败即拒绝新的数据库心跳；绝不复活已失去所有权的 Worker。"""
     if not budget.renew(part_id, generation, lease_id, lease_until):
         raise BudgetUnavailable("worker budget ownership was lost")
     return state.heartbeat_part(

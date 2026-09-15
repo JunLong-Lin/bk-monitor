@@ -1,4 +1,4 @@
-"""Registered immutable export artifacts, with no upload-time expiry."""
+"""已登记的不可变导出产物，上传时不做任何过期设置。"""
 
 import base64
 import hashlib
@@ -12,8 +12,8 @@ from qcloud_cos import CosConfig, CosS3Client
 from qcloud_cos.cos_exception import CosServiceError
 from requests.auth import HTTPBasicAuth
 
-from apps.log_search.export_models import ExportArtifact, ExportJob
-from apps.log_search.export_worker import CheckedFile, PartError, UnconfirmedQueryExit
+from apps.log_search.export.models import ExportArtifact, ExportJob
+from apps.log_search.export.worker import CheckedFile, PartError, UnconfirmedQueryExit
 
 
 def artifact_prefix(job):
@@ -22,7 +22,7 @@ def artifact_prefix(job):
 
 
 class RegisteredArtifactStore:
-    """Storage-independent registration, immutability, and recovery rules."""
+    """与具体存储无关的登记、不可变与恢复规则。"""
 
     def __init__(self, storage_id):
         self.storage_id = storage_id
@@ -57,14 +57,13 @@ class RegisteredArtifactStore:
                 raise PartError("ARTIFACT_IDENTITY_MISMATCH")
             if not created and record.status != ExportArtifact.Status.READY:
                 raise PartError("ARTIFACT_UPLOAD_PENDING")
-            # READY is immutable and already safe to reuse. Downgrading it
-            # before HEAD would make a worker crash turn a valid object into an
-            # unrecoverable UPLOADING marker.
+            # READY 是不可变且可直接复用的；若在 HEAD 之前降级，
+            # Worker 崩溃就会把有效对象变成无法恢复的 UPLOADING 标记。
         uncertain = False
         try:
             existing = self.head(key, guard)
             if existing is None:
-                md5 = hashlib.md5()  # Transport checksum, not an identity/security hash.
+                md5 = hashlib.md5()  # 传输校验，不用于身份或安全判定。
                 sha256 = hashlib.sha256()
                 with artifact.path.open("rb") as stream:
                     reader = CheckedFile(stream, guard)
@@ -80,8 +79,8 @@ class RegisteredArtifactStore:
             uncertain = True
             raise
         finally:
-            # A completed or never-started PUT may be cleaned after terminal
-            # state. An uncertain PUT retains its durable marker indefinitely.
+            # 已完成或从未开始的 PUT 可以在终态后清理；
+            # 结果不确定的 PUT 会永久保留其持久化标记。
             if not uncertain:
                 ExportArtifact.objects.filter(pk=record.pk, status=ExportArtifact.Status.UPLOADING).update(
                     status=ExportArtifact.Status.READY
@@ -115,7 +114,7 @@ class CosArtifactStore(RegisteredArtifactStore):
         try:
             return client.head_object(Bucket=self.bucket, Key=key)
         except CosServiceError as error:
-            # HEAD commonly has no XML body, so SDK error code may be Unknown.
+            # HEAD 通常没有 XML 响应体，SDK 可能给出 Unknown 错误码。
             if error.get_status_code() == 404 and error.get_error_code() != "NoSuchBucket":
                 return None
             raise
@@ -165,7 +164,7 @@ class CosArtifactStore(RegisteredArtifactStore):
 
 
 class BKRepoHttpClient:
-    """The installed BKRepo SDK protocol with a per-call timeout."""
+    """按已安装的 BKRepo SDK 协议实现，并支持单次调用超时。"""
 
     def __init__(self, endpoint_url, project, bucket, username, password, session=None):
         self.endpoint_url = endpoint_url.rstrip("/")
@@ -273,8 +272,8 @@ class BKRepoArtifactStore(RegisteredArtifactStore):
                         record.checksum,
                         min(guard(), settings.ASYNC_EXPORT_BKREPO_TIMEOUT),
                     )
-            # Once requests starts consuming the stream, even a lease guard or
-            # local read error cannot prove whether BKRepo persisted the object.
+            # requests 一旦开始消费数据流，即使是租约校验或本地读取错误，
+            # 也无法证明 BKRepo 是否已落盘。
             except Exception as error:
                 if self._reconcile_upload(record, guard):
                     return
@@ -303,8 +302,8 @@ class BKRepoArtifactStore(RegisteredArtifactStore):
 
 
 def cos_artifact_store():
-    # Reuse the installed COS SDK; the legacy storage wrapper only returns an
-    # ETag and cannot enforce this workflow's timeout/metadata/cleanup contract.
+    # 直接复用已安装的 COS SDK；旧 Storage 包装器只返回 ETag，
+    # 无法满足本流程的超时、元数据与清理契约。
     config = dict(settings.ASYNC_EXPORT_COS)
     bucket = config.pop("Bucket")
     identity = hashlib.sha256(json.dumps([config.get("Region"), bucket]).encode()).hexdigest()

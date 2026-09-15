@@ -1,4 +1,4 @@
-"""Manifest commit and cleanup of registered, safely idle COS artifacts."""
+"""Manifest 提交，以及已登记、确认空闲的远端产物清理。"""
 
 import hashlib
 import json
@@ -10,11 +10,11 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from apps.log_search import export_state as state
-from apps.log_search.export_models import ExportArtifact, ExportJob, ExportPart, ExportPlan
-from apps.log_search.export_storage import artifact_prefix
-from apps.log_search.export_worker import Artifact, PartError
-from apps.log_search.export_files import export_temporary_directory
+from apps.log_search.export import state
+from apps.log_search.export.models import ExportArtifact, ExportJob, ExportPart, ExportPlan
+from apps.log_search.export.storage import artifact_prefix
+from apps.log_search.export.worker import Artifact, PartError
+from apps.log_search.export.files import export_temporary_directory
 
 
 def manifest_snapshot(job):
@@ -50,8 +50,8 @@ def manifest_snapshot(job):
         )
     if cursor != job.end_time or sum(p.actual_rows for p in parts) != job.actual_total:
         raise PartError("MANIFEST_TOTAL_INVALID")
-    # Absolute expiry is authoritative in the Job, computed at the subsequent
-    # DB success commit. It cannot truthfully be predicted in an uploaded file.
+    # 绝对到期时间以 Job 为准，在随后的成功事务中计算；上传的文件里
+    # 无法给出真实值，因此只记录成功后保留时长。
     return dict(
         schema_version=1,
         job_id=job.pk,
@@ -117,7 +117,6 @@ def finalize_export(job_id, store):
             plan_version=job.current_plan_version,
             manifest_object_key=key,
             manifest_checksum=checksum,
-            expected_state_version=job.state_version,
         )
     except Exception as error:
         with transaction.atomic():
@@ -140,7 +139,7 @@ def cleanup_export(job_id, store, limit=100):
             return 0
         if job.artifacts.filter(status=ExportArtifact.Status.UPLOADING).exists():
             return 0
-        candidates = job.artifacts.filter(status__in=[ExportArtifact.Status.READY, ExportArtifact.Status.DELETING])
+        candidates = job.artifacts.filter(status=ExportArtifact.Status.READY)
         if job.status == ExportJob.Status.SUCCESS:
             if job.expires_at is None:
                 return 0
@@ -150,11 +149,6 @@ def cleanup_export(job_id, store, limit=100):
                 ).values("object_key")
                 candidates = candidates.exclude(object_key=job.manifest_object_key).exclude(object_key__in=referenced)
         records = list(candidates.filter(storage_id=store.storage_id).order_by("updated_at", "pk")[:limit])
-        # No new registration/commit is allowed after terminal state. Retrying
-        # DELETING is safe after a lost delete response; immutable keys stay retired.
-        ExportArtifact.objects.filter(pk__in=[r.pk for r in records]).update(
-            status=ExportArtifact.Status.DELETING, updated_at=timezone.now()
-        )
     deleted = 0
     deadline = time.monotonic() + settings.ASYNC_EXPORT_CLEANUP_DEADLINE
 
@@ -168,9 +162,8 @@ def cleanup_export(job_id, store, limit=100):
         try:
             store.delete(record, guard)
         except Exception:
+            # 保留 READY，由下一轮扫描重试；不可变对象键不会重新发布。
             continue
-        ExportArtifact.objects.filter(pk=record.pk, status=ExportArtifact.Status.DELETING).update(
-            status=ExportArtifact.Status.DELETED
-        )
+        ExportArtifact.objects.filter(pk=record.pk).delete()
         deleted += 1
     return deleted

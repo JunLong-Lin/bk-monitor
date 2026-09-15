@@ -1,4 +1,4 @@
-"""Value objects and errors shared by export planning, state and query I/O."""
+"""导出规划、状态与查询 I/O 共享的值对象和错误。"""
 
 from dataclasses import dataclass, replace
 
@@ -9,7 +9,7 @@ SPLITTABLE_PART_ERROR_CODES = frozenset({"OVERSIZED"})
 
 
 class ExportStateError(Exception):
-    """A rejected export operation."""
+    """被拒绝的导出操作。"""
 
 
 class InvalidTransitionError(ExportStateError):

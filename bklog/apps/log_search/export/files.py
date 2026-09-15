@@ -1,4 +1,4 @@
-"""Local temporary files with process locks, including crash cleanup."""
+"""本机临时文件与进程锁，含进程被强杀后的残留清理。"""
 
 import fcntl
 import hashlib
@@ -28,10 +28,10 @@ def export_temporary_directory(kind):
 
 
 def cleanup_temporary_files(limit=100):
-    """Age is only a candidate filter; a held OS lock always prevents deletion.
+    """目录年龄只用于筛选候选，持有操作系统文件锁的目录永远不会被删除。
 
-    Run on every dedicated worker host. This must use local disk, not a shared
-    filesystem whose locking/ownership semantics have not been established.
+    需要在每台专用 Worker 主机上执行，且必须使用本地磁盘；不能用于锁语义
+    和归属尚未验证的共享文件系统。
     """
     cutoff = time.time() - max(60, settings.ASYNC_EXPORT_TEMP_RETENTION_SECONDS)
     deadline = time.monotonic() + 2

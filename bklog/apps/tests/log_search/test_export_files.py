@@ -5,7 +5,7 @@ from pathlib import Path
 
 from django.test import SimpleTestCase, override_settings
 
-from apps.log_search.export_files import cleanup_temporary_files, export_temporary_directory, temporary_root
+from apps.log_search.export.files import cleanup_temporary_files, export_temporary_directory, temporary_root
 
 
 class TemporaryFileTest(SimpleTestCase):

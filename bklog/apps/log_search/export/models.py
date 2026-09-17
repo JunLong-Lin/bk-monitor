@@ -7,7 +7,6 @@
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
-from django.db.models import F, Q
 from django.utils.translation import gettext_lazy as _
 
 
@@ -94,20 +93,7 @@ class ExportJob(PlanningRecord):
 
     class Meta:
         db_table = "log_export_job"
-        constraints = [
-            models.UniqueConstraint(
-                fields=["space_uid", "created_by", "request_id"],
-                name="export_job_request_uniq",
-            ),
-            models.CheckConstraint(check=~Q(request_id=""), name="export_job_request_nonempty"),
-            models.CheckConstraint(check=Q(end_time__gt=F("start_time")), name="export_job_time_range"),
-            models.CheckConstraint(check=Q(time_tick__gte=1), name="export_job_tick_positive"),
-            models.CheckConstraint(
-                check=Q(requested_parallelism__gte=1, requested_parallelism__lte=8),
-                name="export_job_parallelism",
-            ),
-            models.CheckConstraint(check=Q(current_plan_version__gte=1), name="export_job_plan_positive"),
-        ]
+        unique_together = (("space_uid", "created_by", "request_id"),)
         indexes = [
             models.Index(fields=["created_by", "status", "created_at"], name="export_job_user_status"),
             models.Index(fields=["space_uid", "created_at", "id"], name="export_job_space_history"),
@@ -140,14 +126,7 @@ class ExportPlan(ExportRecord):
 
     class Meta:
         db_table = "log_export_plan"
-        constraints = [
-            models.UniqueConstraint(fields=["job", "plan_version"], name="export_plan_version_uniq"),
-            models.CheckConstraint(check=Q(plan_version__gte=1), name="export_plan_version_positive"),
-            models.CheckConstraint(
-                check=Q(target_rows__gte=1, target_bytes__gte=1, histogram_interval__gte=1),
-                name="export_plan_targets_positive",
-            ),
-        ]
+        unique_together = (("job", "plan_version"),)
         indexes = []
 
 
@@ -218,15 +197,7 @@ class ExportPart(PlanningRecord):
 
     class Meta:
         db_table = "log_export_part"
-        constraints = [
-            models.UniqueConstraint(fields=["plan", "part_no"], name="export_part_number_uniq"),
-            models.CheckConstraint(check=Q(part_no__gte=1), name="export_part_number_positive"),
-            models.CheckConstraint(check=Q(end_time__gt=F("start_time")), name="export_part_time_range"),
-            models.CheckConstraint(
-                check=Q(status="SPLIT", is_leaf=False) | (~Q(status="SPLIT") & Q(is_leaf=True)),
-                name="export_part_split_leaf",
-            ),
-        ]
+        unique_together = (("plan", "part_no"),)
         indexes = [
             models.Index(fields=["status", "next_retry_at"], name="export_part_waiting"),
             models.Index(fields=["plan", "is_leaf", "status"], name="export_part_plan_leaves"),

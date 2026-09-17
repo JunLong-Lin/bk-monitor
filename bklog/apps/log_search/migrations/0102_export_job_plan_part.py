@@ -142,6 +142,7 @@ class Migration(migrations.Migration):
             ],
             options={
                 "db_table": "log_export_job",
+                "unique_together": {("space_uid", "created_by", "request_id")},
             },
         ),
         migrations.CreateModel(
@@ -203,6 +204,7 @@ class Migration(migrations.Migration):
             ],
             options={
                 "db_table": "log_export_plan",
+                "unique_together": {("job", "plan_version")},
             },
         ),
         migrations.CreateModel(
@@ -311,6 +313,7 @@ class Migration(migrations.Migration):
             ],
             options={
                 "db_table": "log_export_part",
+                "unique_together": {("plan", "part_no")},
             },
         ),
         migrations.AddIndex(
@@ -329,63 +332,11 @@ class Migration(migrations.Migration):
             model_name="exportjob",
             index=models.Index(fields=["expires_at"], name="export_job_expiry"),
         ),
-        migrations.AddConstraint(
-            model_name="exportjob",
-            constraint=models.UniqueConstraint(
-                fields=("space_uid", "created_by", "request_id"), name="export_job_request_uniq"
-            ),
-        ),
-        migrations.AddConstraint(
-            model_name="exportjob",
-            constraint=models.CheckConstraint(
-                check=models.Q(("request_id", ""), _negated=True), name="export_job_request_nonempty"
-            ),
-        ),
-        migrations.AddConstraint(
-            model_name="exportjob",
-            constraint=models.CheckConstraint(
-                check=models.Q(("end_time__gt", models.F("start_time"))), name="export_job_time_range"
-            ),
-        ),
-        migrations.AddConstraint(
-            model_name="exportjob",
-            constraint=models.CheckConstraint(check=models.Q(("time_tick__gte", 1)), name="export_job_tick_positive"),
-        ),
-        migrations.AddConstraint(
-            model_name="exportjob",
-            constraint=models.CheckConstraint(
-                check=models.Q(("requested_parallelism__gte", 1), ("requested_parallelism__lte", 8)),
-                name="export_job_parallelism",
-            ),
-        ),
-        migrations.AddConstraint(
-            model_name="exportjob",
-            constraint=models.CheckConstraint(
-                check=models.Q(("current_plan_version__gte", 1)), name="export_job_plan_positive"
-            ),
-        ),
         migrations.AddField(
             model_name="exportartifact",
             name="job",
             field=models.ForeignKey(
                 on_delete=django.db.models.deletion.PROTECT, related_name="artifacts", to="log_search.exportjob"
-            ),
-        ),
-        migrations.AddConstraint(
-            model_name="exportplan",
-            constraint=models.UniqueConstraint(fields=("job", "plan_version"), name="export_plan_version_uniq"),
-        ),
-        migrations.AddConstraint(
-            model_name="exportplan",
-            constraint=models.CheckConstraint(
-                check=models.Q(("plan_version__gte", 1)), name="export_plan_version_positive"
-            ),
-        ),
-        migrations.AddConstraint(
-            model_name="exportplan",
-            constraint=models.CheckConstraint(
-                check=models.Q(("histogram_interval__gte", 1), ("target_bytes__gte", 1), ("target_rows__gte", 1)),
-                name="export_plan_targets_positive",
             ),
         ),
         migrations.AddIndex(
@@ -399,31 +350,6 @@ class Migration(migrations.Migration):
         migrations.AddIndex(
             model_name="exportpart",
             index=models.Index(fields=["lease_until"], name="export_part_lease"),
-        ),
-        migrations.AddConstraint(
-            model_name="exportpart",
-            constraint=models.UniqueConstraint(fields=("plan", "part_no"), name="export_part_number_uniq"),
-        ),
-        migrations.AddConstraint(
-            model_name="exportpart",
-            constraint=models.CheckConstraint(check=models.Q(("part_no__gte", 1)), name="export_part_number_positive"),
-        ),
-        migrations.AddConstraint(
-            model_name="exportpart",
-            constraint=models.CheckConstraint(
-                check=models.Q(("end_time__gt", models.F("start_time"))), name="export_part_time_range"
-            ),
-        ),
-        migrations.AddConstraint(
-            model_name="exportpart",
-            constraint=models.CheckConstraint(
-                check=models.Q(
-                    models.Q(("is_leaf", False), ("status", "SPLIT")),
-                    models.Q(models.Q(("status", "SPLIT"), _negated=True), ("is_leaf", True)),
-                    _connector="OR",
-                ),
-                name="export_part_split_leaf",
-            ),
         ),
         migrations.AddIndex(
             model_name="exportartifact",

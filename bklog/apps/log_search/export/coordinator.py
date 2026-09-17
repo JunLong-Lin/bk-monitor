@@ -51,9 +51,8 @@ def dimensions(job, oversized):
     resources = job.resolved_resource_ids
     if not isinstance(resources, list) or not resources or any(not isinstance(r, str) or not r for r in resources):
         raise BudgetUnavailable("complete canonical resource IDs are required")
-    tenant = hashlib.sha256(job.bk_tenant_id.encode()).hexdigest()
     values = ["global", f"job:{job.pk}"]
-    values.extend(f"index:{tenant}:{hashlib.sha256(r.encode()).hexdigest()}" for r in sorted(set(resources)))
+    values.extend(f"index:{hashlib.sha256(r.encode()).hexdigest()}" for r in sorted(set(resources)))
     if oversized:
         values.append("oversized")
     return values

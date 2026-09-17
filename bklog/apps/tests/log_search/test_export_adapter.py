@@ -28,7 +28,6 @@ class NativeAdapterTest(SimpleTestCase):
             query_kind="single",
             index_set_ids=[1],
             created_by="alice",
-            bk_tenant_id="tenant",
             space_uid="bkcc__2",
             source_app_code="bk_log",
             resolved_resource_ids=["index:1"],
@@ -41,6 +40,12 @@ class NativeAdapterTest(SimpleTestCase):
             },
             routing_snapshot={"query_list": deepcopy(self.base["query_list"])},
         )
+        space = patch(
+            "apps.log_search.export.adapter.Space.objects.get",
+            return_value=SimpleNamespace(bk_tenant_id="tenant", bk_biz_id=2),
+        )
+        space.start()
+        self.addCleanup(space.stop)
 
     def test_identity_restored_on_failure_and_absent_context_removed(self):
         previous = get_request(peaceful=True)
@@ -61,7 +66,7 @@ class NativeAdapterTest(SimpleTestCase):
             if previous is not None:
                 activate_request(previous, previous.request_id)
 
-    def test_native_transport_passes_timeout_tenant_and_preserves_api_singleton(self):
+    def test_native_transport_uses_api_tenant_resolution_and_preserves_api_singleton(self):
         apis = _UnifyQueryApi()
         apis.query_ts_raw_with_scroll.data_api_retry_cls = object()
         original_retry = apis.query_ts_raw_with_scroll.data_api_retry_cls
@@ -75,7 +80,7 @@ class NativeAdapterTest(SimpleTestCase):
         with export_identity(self.job), patch.object(native, "_send_request", return_value=response) as send:
             self.assertTrue(query.read(params, timeout=2.5)["done"])
             self.assertEqual(send.call_args.args[1], 2.5)
-            self.assertEqual(send.call_args.args[-2:], (False, "tenant"))
+            self.assertEqual(send.call_args.args[-2:], (False, ""))
             self.assertEqual(send.call_args.args[0]["bk_username"], "alice")
         self.assertEqual(params["end_time"], "20")
         self.assertEqual(self.base["end_time"], "60")
@@ -103,14 +108,17 @@ class NativeAdapterTest(SimpleTestCase):
             with patch("apps.log_search.export.adapter.UnifyQueryApi", _UnifyQueryApi()):
                 query = NativeQuery(self.job, Mock())
             query.apis["query_ts_raw_with_scroll"].url = f"http://127.0.0.1:{server.server_port}/raw_with_scroll/"
-            with export_identity(self.job):
-                result = query.read(query.request(10, 20), timeout=2)
+            with patch("apps.log_search.models.Space.get_tenant_id", return_value="tenant") as resolve_tenant:
+                with export_identity(self.job):
+                    result = query.read(query.request(10, 20), timeout=2)
+                resolve_tenant.assert_called_with(bk_biz_id=2)
             self.assertEqual(result, {"list": [], "done": True})
             headers, body = received[0]
             headers = {key.lower(): value for key, value in headers.items()}
             self.assertEqual(json.loads(headers["x-bkapi-authorization"])["bk_username"], "alice")
             self.assertEqual(headers["bk-query-source"], "username:alice")
             self.assertEqual(headers["x-bk-scope-space-uid"], "bkcc__2")
+            self.assertEqual(headers["x-bk-tenant-id"], "tenant")
             self.assertEqual(body["slice_max"], 0)
         finally:
             server.shutdown()
@@ -144,7 +152,7 @@ class NativeAdapterTest(SimpleTestCase):
         handler._deal_query_result.side_effect = lambda response: {"origin_log_list": [{"log": "masked"}]}
         return patch.multiple(
             "apps.log_search.export.adapter",
-            Space=Mock(objects=Mock(get=Mock(return_value=SimpleNamespace(bk_biz_id=2)))),
+            Space=Mock(objects=Mock(get=Mock(return_value=SimpleNamespace(bk_tenant_id="tenant", bk_biz_id=2)))),
             LogIndexSet=Mock(objects=Mock(get=Mock(return_value=SimpleNamespace(space_uid="bkcc__2")))),
             PlatformAwareIndexSearchPermission=Mock(),
             UnifyQueryHandler=Mock(return_value=handler),

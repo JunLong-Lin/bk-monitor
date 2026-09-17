@@ -33,7 +33,6 @@ from apps.log_search.export.state import (
 class ExportStateTest(TestCase):
     def create_job(self, *, end_time=20):
         return ExportJob.objects.create(
-            bk_tenant_id="tenant-a",
             space_uid="space-a",
             created_by="alice",
             source_app_code="bk_log_search",

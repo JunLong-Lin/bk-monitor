@@ -56,7 +56,6 @@ class ExportJob(PlanningRecord):
         UPLOAD = "UPLOAD", _("上传")
         FINALIZING = "FINALIZING", _("生成清单")
 
-    bk_tenant_id = models.CharField(_("租户ID"), max_length=64)
     space_uid = models.CharField(_("空间标识"), max_length=256)
     created_by = models.CharField(_("创建者"), max_length=64)
     source_app_code = models.CharField(_("来源应用"), max_length=32, blank=True, default="")
@@ -97,7 +96,7 @@ class ExportJob(PlanningRecord):
         db_table = "log_export_job"
         constraints = [
             models.UniqueConstraint(
-                fields=["bk_tenant_id", "space_uid", "created_by", "request_id"],
+                fields=["space_uid", "created_by", "request_id"],
                 name="export_job_request_uniq",
             ),
             models.CheckConstraint(check=~Q(request_id=""), name="export_job_request_nonempty"),
@@ -110,8 +109,8 @@ class ExportJob(PlanningRecord):
             models.CheckConstraint(check=Q(current_plan_version__gte=1), name="export_job_plan_positive"),
         ]
         indexes = [
-            models.Index(fields=["bk_tenant_id", "created_by", "status", "created_at"], name="export_job_user_status"),
-            models.Index(fields=["bk_tenant_id", "space_uid", "created_at", "id"], name="export_job_space_history"),
+            models.Index(fields=["created_by", "status", "created_at"], name="export_job_user_status"),
+            models.Index(fields=["space_uid", "created_at", "id"], name="export_job_space_history"),
             models.Index(fields=["status", "updated_at"], name="export_job_recovery"),
             models.Index(fields=["expires_at"], name="export_job_expiry"),
         ]

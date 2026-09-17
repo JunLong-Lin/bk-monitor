@@ -5,7 +5,6 @@ from apps.log_search.export.models import ExportJob
 
 def create_job(**extra):
     values = dict(
-        bk_tenant_id="tenant",
         space_uid="space",
         created_by="alice",
         query_kind="single",

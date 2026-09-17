@@ -54,7 +54,6 @@ class Migration(migrations.Migration):
                 ("planning_started_at", models.DateTimeField(blank=True, null=True)),
                 ("planning_lease_until", models.DateTimeField(blank=True, null=True)),
                 ("next_planning_at", models.DateTimeField(blank=True, null=True)),
-                ("bk_tenant_id", models.CharField(max_length=64, verbose_name="租户ID")),
                 ("space_uid", models.CharField(max_length=256, verbose_name="空间标识")),
                 ("created_by", models.CharField(max_length=64, verbose_name="创建者")),
                 ("source_app_code", models.CharField(blank=True, default="", max_length=32, verbose_name="来源应用")),
@@ -316,15 +315,11 @@ class Migration(migrations.Migration):
         ),
         migrations.AddIndex(
             model_name="exportjob",
-            index=models.Index(
-                fields=["bk_tenant_id", "created_by", "status", "created_at"], name="export_job_user_status"
-            ),
+            index=models.Index(fields=["created_by", "status", "created_at"], name="export_job_user_status"),
         ),
         migrations.AddIndex(
             model_name="exportjob",
-            index=models.Index(
-                fields=["bk_tenant_id", "space_uid", "created_at", "id"], name="export_job_space_history"
-            ),
+            index=models.Index(fields=["space_uid", "created_at", "id"], name="export_job_space_history"),
         ),
         migrations.AddIndex(
             model_name="exportjob",
@@ -337,7 +332,7 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name="exportjob",
             constraint=models.UniqueConstraint(
-                fields=("bk_tenant_id", "space_uid", "created_by", "request_id"), name="export_job_request_uniq"
+                fields=("space_uid", "created_by", "request_id"), name="export_job_request_uniq"
             ),
         ),
         migrations.AddConstraint(

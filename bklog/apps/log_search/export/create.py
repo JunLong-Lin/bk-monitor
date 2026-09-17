@@ -20,7 +20,6 @@ from apps.log_unifyquery.handler.base import UnifyQueryHandler
 from apps.utils.local import (
     get_request_app_code,
     get_request_external_username,
-    get_request_tenant_id,
     get_request_username,
 )
 
@@ -47,7 +46,7 @@ def create_export(request, data):
     space, index = authorized_scope(request, data["space_uid"], data["index_set_id"])
     if index.is_group:
         raise ValidationError("QUERY_MODE_NOT_IMPLEMENTED")
-    identity = dict(bk_tenant_id=get_request_tenant_id(), space_uid=space.space_uid, created_by=username)
+    identity = dict(space_uid=space.space_uid, created_by=username)
     source_app = get_request_app_code()
     request_hash = digest({"input": data, "source_app_code": source_app})
     # 在 Handler 初始化之前先检查（初始化可能远程解析元数据）；

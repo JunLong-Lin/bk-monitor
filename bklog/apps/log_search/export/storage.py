@@ -17,7 +17,7 @@ from apps.log_search.export.worker import CheckedFile, PartError, UnconfirmedQue
 
 
 def artifact_prefix(job):
-    scope = json.dumps([settings.ASYNC_EXPORT_NAMESPACE, job.bk_tenant_id, job.space_uid], separators=(",", ":"))
+    scope = json.dumps([settings.ASYNC_EXPORT_NAMESPACE, job.space_uid], separators=(",", ":"))
     return f"exports/{hashlib.sha256(scope.encode()).hexdigest()}/{job.pk}/"
 
 

@@ -48,7 +48,6 @@ def authorized_job(request, job_id, space_uid, *, operate=False):
     job = get_object_or_404(
         ExportJob,
         pk=job_id,
-        bk_tenant_id=get_request_tenant_id(),
         space_uid=space_uid,
         source_app_code=get_request_app_code(),
     )

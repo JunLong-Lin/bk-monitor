@@ -14,6 +14,7 @@ from apps.log_search.export.api import (
     ExportConflict,
     ExportExpired,
     authorized_job,
+    authorized_scope,
     download_link,
     job_detail,
     job_results,
@@ -100,14 +101,18 @@ class ExportAPITest(TestCase):
         self.assertEqual(detail["inflight_parts"], 0)
 
     def test_scope_mismatch_is_not_found_before_iam(self):
-        for getter in (self.get_request_tenant_id, self.get_request_app_code):
-            original = getter.return_value
-            getter.return_value = "other"
-            with self.assertRaises(Http404):
-                authorized_job(None, self.job.pk, "space")
-            getter.return_value = original
+        self.get_request_app_code.return_value = "other"
+        with self.assertRaises(Http404):
+            authorized_job(None, self.job.pk, "space")
+        self.get_request_app_code.return_value = "app"
         with self.assertRaises(Http404):
             authorized_job(None, self.job.pk, "other-space")
+
+    def test_scope_rejects_space_from_other_tenant(self):
+        Space.objects.create(space_uid="space", bk_tenant_id="tenant", bk_biz_id=1)
+        self.get_request_tenant_id.return_value = "other"
+        with self.assertRaises(Http404):
+            authorized_scope(None, "space", 1)
 
     def test_missing_identity_and_unimplemented_mode_are_denied(self):
         self.get_request_username.return_value = ""
@@ -244,7 +249,6 @@ class ExportAPITest(TestCase):
 
         with (
             patch("apps.log_search.views.export_views.authorized_job", side_effect=authorize),
-            patch("apps.log_search.views.export_views.get_request_tenant_id", return_value="tenant"),
             patch("apps.log_search.views.export_views.get_request_app_code", return_value="app"),
         ):
             response = view(request)

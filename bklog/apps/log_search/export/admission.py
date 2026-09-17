@@ -73,7 +73,7 @@ def create_job(**values):
     with admission_lock(values["created_by"], values["query_kind"] == ExportJob.QueryKind.SCENE):
         if values.get("request_id"):
             existing = ExportJob.objects.filter(
-                **{key: values[key] for key in ("bk_tenant_id", "space_uid", "created_by", "request_id")}
+                **{key: values[key] for key in ("space_uid", "created_by", "request_id")}
             ).first()
             if existing:
                 if existing.query_hash != values["query_hash"]:

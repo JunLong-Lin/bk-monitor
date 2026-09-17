@@ -11,7 +11,7 @@ from apps.log_search.export.create import create_export
 from apps.log_search.export.models import ExportJob
 from apps.log_search.export.serializers import ExportCreateSerializer
 from apps.utils.drf import detail_route
-from apps.utils.local import get_request_app_code, get_request_tenant_id
+from apps.utils.local import get_request_app_code
 
 
 class ExportScopeSerializer(serializers.Serializer):
@@ -43,7 +43,6 @@ class ExportJobViewSet(APIViewSet):
     def list(self, request):
         data = self.valid_serializer(ExportListSerializer).validated_data
         queryset = ExportJob.objects.filter(
-            bk_tenant_id=get_request_tenant_id(),
             space_uid=data["space_uid"],
             source_app_code=get_request_app_code(),
         ).order_by("-created_at", "-pk")

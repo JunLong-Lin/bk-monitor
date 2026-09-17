@@ -22,10 +22,11 @@ def export_identity(job):
     previous = get_request(peaceful=True)
     missing = object()
     previous_timezone = get_local_param("time_zone", missing)
+    tenant_id = Space.objects.get(space_uid=job.space_uid).bk_tenant_id
     request = HttpRequest()
     request.method = "POST"
-    request.user = SimpleNamespace(username=job.created_by, tenant_id=job.bk_tenant_id, is_authenticated=True)
-    request.META.update(HTTP_X_BK_TENANT_ID=job.bk_tenant_id, HTTP_BK_APP_CODE=job.source_app_code)
+    request.user = SimpleNamespace(username=job.created_by, tenant_id=tenant_id, is_authenticated=True)
+    request.META.update(HTTP_X_BK_TENANT_ID=tenant_id, HTTP_BK_APP_CODE=job.source_app_code)
     request.data = deepcopy(job.query_snapshot["search_params"])
     request.data.update(space_uid=job.space_uid)
     request.query_params = {}
@@ -67,7 +68,7 @@ class NativeQuery(UnifyQueryStatistics):
         params = deepcopy(params)
         # 否则 Celery 的 API 预处理会回退成后台管理员账号。
         params.update(bk_username=self.job.created_by, operator=self.job.created_by, no_request=True)
-        return self.apis[name](params, timeout=timeout, bk_tenant_id=self.job.bk_tenant_id, request_cookies=False)
+        return self.apis[name](params, timeout=timeout, request_cookies=False)
 
     def read(self, params, *, timeout):
         return self.call("query_ts_raw_with_scroll", params, timeout)
@@ -88,14 +89,13 @@ def native_query_factory(job):
     params = deepcopy(job.query_snapshot.get("search_params", {}))
     if (
         not job.created_by
-        or not job.bk_tenant_id
         or params.get("index_set_ids") != job.index_set_ids
         or job.resolved_resource_ids != [f"index:{index_id}"]
         or params.get("original_search")
         or params.get("is_desensitize") is False
     ):
         raise PlanningError("INVALID_QUERY_IDENTITY")
-    space = Space.objects.get(space_uid=job.space_uid, bk_tenant_id=job.bk_tenant_id)
+    space = Space.objects.get(space_uid=job.space_uid)
     index = LogIndexSet.objects.get(pk=index_id)
     if getattr(index, "is_group", False):
         raise PlanningError("QUERY_MODE_NOT_IMPLEMENTED")

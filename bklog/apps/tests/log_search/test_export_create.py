@@ -90,7 +90,6 @@ class CreateExportTest(TestCase):
             "apps.log_search.export.create.get_request_username": {"return_value": "alice"},
             "apps.log_search.export.create.get_request_external_username": {"return_value": ""},
             "apps.log_search.export.create.get_request_app_code": {"return_value": "app"},
-            "apps.log_search.export.create.get_request_tenant_id": {"return_value": "tenant"},
             "apps.log_search.export.api.get_request_tenant_id": {"return_value": "tenant"},
             "apps.log_search.export.api.get_request_username": {"return_value": "alice"},
             "apps.log_search.export.api.BusinessActionPermission.has_permission": {"return_value": True},

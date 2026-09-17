@@ -71,11 +71,10 @@ class CoordinatorTest(TestCase):
             self.budget, self.publish, namespace="test-environment", limits=Limits(8, 4, 1, 60)
         )
 
-    def ready(self, *, resources=None, parallelism=4, tenant="tenant", oversized=False):
+    def ready(self, *, resources=None, parallelism=4, oversized=False):
         job = create_job(
             resolved_resource_ids=resources or ["index:1"],
             requested_parallelism=parallelism,
-            bk_tenant_id=tenant,
             end_time=10,
         )
         state.begin_planning(job.pk)
@@ -108,9 +107,9 @@ class CoordinatorTest(TestCase):
         )
         self.assertEqual(ExportPart.objects.filter(plan__job=other, status="DISPATCHED").count(), 4)
 
-    def test_tenants_do_not_share_index_but_share_global_capacity(self):
-        self.ready(tenant="first")
-        self.ready(tenant="second")
+    def test_distinct_indexes_share_global_capacity(self):
+        self.ready(resources=["index:1"])
+        self.ready(resources=["index:2"])
         self.assertEqual(len(self.coordinator.tick()), 8)
 
     def test_oversized_budget_does_not_bypass_global_budget(self):
@@ -356,7 +355,6 @@ class AdmissionTest(TestCase):
         for _ in range(3):
             AsyncTask.objects.create(created_by="alice", export_type=ExportType.ASYNC, request_param={})
         values = dict(
-            bk_tenant_id="tenant",
             space_uid="space",
             created_by="alice",
             query_kind="single",
@@ -375,7 +373,6 @@ class AdmissionTest(TestCase):
         from apps.log_search.export.admission import create_job as admit
 
         values = dict(
-            bk_tenant_id="tenant",
             space_uid="space",
             created_by="alice",
             query_kind="single",

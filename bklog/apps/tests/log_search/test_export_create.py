@@ -235,7 +235,7 @@ class CreateExportTest(TestCase):
             {"ASYNC_EXPORT_ARTIFACT_STORE_FACTORY": ""},
             {"ASYNC_EXPORT_FINALIZE_TASK": ""},
             {"ASYNC_EXPORT_GLOBAL_LIMIT": 0},
-            {"ASYNC_EXPORT_LEASE_SECONDS": 0},
+            {"ASYNC_EXPORT_LEASE_SECONDS": 1},
             {"ASYNC_EXPORT_VERIFIED_QUERY_KINDS": []},
             {"ASYNC_EXPORT_QUERY_END_MODES": {}},
         ):

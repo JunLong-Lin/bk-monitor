@@ -73,7 +73,6 @@ class ExportJob(PlanningRecord):
     end_time = models.BigIntegerField(_("不包含的时间上界"))
     time_tick = models.PositiveBigIntegerField(_("最小时间步长"), validators=[MinValueValidator(1)])
     status = models.CharField(_("状态"), max_length=16, choices=Status.choices, default=Status.PENDING)
-    stage = models.CharField(_("阶段"), max_length=16, choices=Stage.choices, default="", blank=True)
     estimated_total = models.PositiveBigIntegerField(_("预计行数"), null=True, blank=True)
     actual_total = models.PositiveBigIntegerField(_("成功叶子实际行数"), default=0)
     requested_parallelism = models.PositiveSmallIntegerField(
@@ -137,7 +136,6 @@ class ExportPlan(ExportRecord):
     target_bytes = models.PositiveBigIntegerField(_("单片目标字节数"), validators=[MinValueValidator(1)])
     histogram_interval = models.PositiveBigIntegerField(_("初始桶宽，单位同Job时间"), validators=[MinValueValidator(1)])
     part_count = models.PositiveIntegerField(_("有效叶子数量"), default=0)
-    planning_heartbeat = models.DateTimeField(_("规划心跳"), null=True, blank=True)
     error_code = models.CharField(_("错误分类"), max_length=64, blank=True, default="")
     error_detail = models.TextField(_("脱敏错误详情"), blank=True, default="")
 
@@ -151,7 +149,7 @@ class ExportPlan(ExportRecord):
                 name="export_plan_targets_positive",
             ),
         ]
-        indexes = [models.Index(fields=["status", "planning_heartbeat"], name="export_plan_recovery")]
+        indexes = []
 
 
 class ExportPart(PlanningRecord):
@@ -259,7 +257,8 @@ class ExportArtifact(ExportRecord):
         READY = "READY"
 
     job = models.ForeignKey(ExportJob, on_delete=models.PROTECT, related_name="artifacts")
-    object_key = models.CharField(max_length=512, unique=True)
+    # ponytail: internal keys stay under 255 chars; use a prefix index if the format grows.
+    object_key = models.CharField(max_length=255, unique=True)
     storage_id = models.CharField(max_length=64)
     checksum = models.CharField(max_length=64)
     content_checksum = models.CharField(max_length=64, blank=True, default="")

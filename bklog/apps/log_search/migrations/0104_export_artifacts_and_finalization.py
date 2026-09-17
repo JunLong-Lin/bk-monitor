@@ -26,7 +26,7 @@ class Migration(migrations.Migration):
                 ("id", models.BigAutoField(primary_key=True, serialize=False)),
                 ("created_at", models.DateTimeField(auto_now_add=True, verbose_name="创建时间")),
                 ("updated_at", models.DateTimeField(auto_now=True, verbose_name="更新时间")),
-                ("object_key", models.CharField(max_length=512, unique=True)),
+                ("object_key", models.CharField(max_length=255, unique=True)),
                 ("storage_id", models.CharField(max_length=64)),
                 ("checksum", models.CharField(max_length=64)),
                 ("content_checksum", models.CharField(blank=True, default="", max_length=64)),
@@ -50,5 +50,17 @@ class Migration(migrations.Migration):
                 "db_table": "log_export_artifact",
                 "indexes": [models.Index(fields=["job", "status"], name="export_artifact_cleanup")],
             },
+        ),
+        migrations.RemoveIndex(
+            model_name="exportplan",
+            name="export_plan_recovery",
+        ),
+        migrations.RemoveField(
+            model_name="exportplan",
+            name="planning_heartbeat",
+        ),
+        migrations.RemoveField(
+            model_name="exportjob",
+            name="stage",
         ),
     ]

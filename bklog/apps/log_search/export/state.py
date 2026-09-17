@@ -292,7 +292,6 @@ def persist_plan(
             job,
             current_plan_version=plan_version,
             status=ExportJob.Status.READY,
-            stage="",
             estimated_total=estimated_total,
             planning_lease_until=None,
             next_planning_at=None,
@@ -601,7 +600,6 @@ def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_
         return _save(
             job,
             status=ExportJob.Status.SUCCESS,
-            stage="",
             actual_total=leaves.aggregate(value=Sum("actual_rows"))["value"] or 0,
             manifest_object_key=manifest_object_key,
             manifest_checksum=manifest_checksum,
@@ -620,7 +618,6 @@ def _finish_job(job, status, *, error_code="", error_detail=""):
     _save(
         job,
         status=status,
-        stage="",
         error_code=error_code,
         error_detail=error_detail,
         completed_at=now,

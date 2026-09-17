@@ -111,6 +111,7 @@ class Migration(migrations.Migration):
                     models.CharField(blank=True, default="", max_length=64, verbose_name="清单SHA256"),
                 ),
                 ("started_at", models.DateTimeField(blank=True, null=True, verbose_name="开始时间")),
+                ("last_dispatched_at", models.DateTimeField(blank=True, null=True, verbose_name="最近一次投递时间")),
                 ("completed_at", models.DateTimeField(blank=True, null=True, verbose_name="完成时间")),
                 ("expires_at", models.DateTimeField(blank=True, null=True, verbose_name="成功产物到期时间")),
                 ("error_code", models.CharField(blank=True, default="", max_length=64, verbose_name="错误分类")),

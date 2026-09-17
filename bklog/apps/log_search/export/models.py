@@ -88,6 +88,7 @@ class ExportJob(PlanningRecord):
     finalization_attempts = models.PositiveIntegerField(default=0)
     next_finalization_at = models.DateTimeField(null=True, blank=True)
     started_at = models.DateTimeField(_("开始时间"), null=True, blank=True)
+    last_dispatched_at = models.DateTimeField(_("最近一次投递时间"), null=True, blank=True)
     completed_at = models.DateTimeField(_("完成时间"), null=True, blank=True)
     expires_at = models.DateTimeField(_("成功产物到期时间"), null=True, blank=True)
     error_code = models.CharField(_("错误分类"), max_length=64, blank=True, default="")

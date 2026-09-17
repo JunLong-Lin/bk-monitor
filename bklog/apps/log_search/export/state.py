@@ -337,7 +337,17 @@ def dispatch_part(part_id, *, lease_id, task_id, lease_until):
             error_detail="",
         )
         if job.status == ExportJob.Status.READY:
-            _save(job, status=ExportJob.Status.RUNNING, started_at=now, state_version=job.state_version + 1)
+            _save(
+                job,
+                status=ExportJob.Status.RUNNING,
+                started_at=now,
+                last_dispatched_at=now,
+                state_version=job.state_version + 1,
+            )
+        else:
+            # 公平调度（aging）依赖最近一次投递时间，RUNNING 状态下每次授权
+            # 新分片都要刷新，避免长任务被误判为长期饥饿。
+            _save(job, last_dispatched_at=now)
         return part
 
 

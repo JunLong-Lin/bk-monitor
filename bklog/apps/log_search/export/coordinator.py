@@ -142,35 +142,66 @@ class Coordinator:
             epoch = self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
             jobs = ExportJob.objects.filter(status__in=[ExportJob.Status.READY, ExportJob.Status.RUNNING])
             limit = settings.ASYNC_EXPORT_SCAN_LIMIT
+            # aging：长时间没有获得投递的 Job 插队优先，再回到持久化 RR 轮转。
+            for job_id in self._aged_job_ids(jobs, limit):
+                dispatched = self._dispatch_from_job(job_id, epoch)
+                if dispatched is not None:
+                    return dispatched
             identifiers = self._round_robin_ids(jobs, gate.cursor, limit)
             for job_id in identifiers:
                 gate.cursor = job_id
                 gate.save(update_fields=["cursor"])
-                job = ExportJob.objects.select_for_update().get(pk=job_id)
-                if job.status not in {ExportJob.Status.READY, ExportJob.Status.RUNNING}:
-                    continue
-                waiting = ExportPart.objects.filter(
-                    plan__job=job,
-                    plan__plan_version=job.current_plan_version,
-                    plan__status=ExportPlan.Status.READY,
-                    status=ExportPart.Status.WAITING,
-                    is_leaf=True,
-                ).filter(Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=timezone.now()))
-                candidates = [waiting.filter(oversized=False).order_by("start_time", "part_no").first()]
-                if self.limits.oversized_limit > 0:
-                    candidates.append(waiting.filter(oversized=True).order_by("start_time", "part_no").first())
-                candidates = sorted((part for part in candidates if part is not None), key=lambda part: part.start_time)
-                for part in candidates:
-                    part.plan.job = job
-                    part.lease_id, part.task_id = uuid4().hex, uuid4().hex
-                    part.dispatch_generation += 1
-                    part.lease_until = timezone.now() + timedelta(seconds=self.limits.lease_seconds)
-                    if not self.budget.acquire(part, epoch, self.limits):
-                        continue
-                    return state.dispatch_part(
-                        part.pk, lease_id=part.lease_id, task_id=part.task_id, lease_until=part.lease_until
-                    )
+                dispatched = self._dispatch_from_job(job_id, epoch)
+                if dispatched is not None:
+                    return dispatched
         return None
+
+    def _dispatch_from_job(self, job_id, epoch):
+        job = ExportJob.objects.select_for_update().get(pk=job_id)
+        if job.status not in {ExportJob.Status.READY, ExportJob.Status.RUNNING}:
+            return None
+        waiting = ExportPart.objects.filter(
+            plan__job=job,
+            plan__plan_version=job.current_plan_version,
+            plan__status=ExportPlan.Status.READY,
+            status=ExportPart.Status.WAITING,
+            is_leaf=True,
+        ).filter(Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=timezone.now()))
+        candidates = [waiting.filter(oversized=False).order_by("start_time", "part_no").first()]
+        if self.limits.oversized_limit > 0:
+            candidates.append(waiting.filter(oversized=True).order_by("start_time", "part_no").first())
+        candidates = sorted((part for part in candidates if part is not None), key=lambda part: part.start_time)
+        for part in candidates:
+            part.plan.job = job
+            part.lease_id, part.task_id = uuid4().hex, uuid4().hex
+            part.dispatch_generation += 1
+            part.lease_until = timezone.now() + timedelta(seconds=self.limits.lease_seconds)
+            if not self.budget.acquire(part, epoch, self.limits):
+                continue
+            return state.dispatch_part(
+                part.pk, lease_id=part.lease_id, task_id=part.task_id, lease_until=part.lease_until
+            )
+        return None
+
+    def _aged_job_ids(self, jobs, limit):
+        aging_seconds = settings.ASYNC_EXPORT_AGING_SECONDS
+        if aging_seconds <= 0:
+            return []
+        now = timezone.now()
+        cutoff = now - timedelta(seconds=aging_seconds)
+        has_waiting = ExportPart.objects.filter(
+            plan__job_id=OuterRef("pk"),
+            plan__plan_version=OuterRef("current_plan_version"),
+            plan__status=ExportPlan.Status.READY,
+            status=ExportPart.Status.WAITING,
+            is_leaf=True,
+        ).filter(Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=now))
+        aged = (
+            jobs.filter(Exists(has_waiting))
+            .filter(Q(last_dispatched_at__isnull=True) | Q(last_dispatched_at__lt=cutoff))
+            .order_by(F("last_dispatched_at").asc(nulls_first=True), "pk")
+        )
+        return list(aged.values_list("pk", flat=True)[:limit])
 
     def deliver(self, part):
         try:

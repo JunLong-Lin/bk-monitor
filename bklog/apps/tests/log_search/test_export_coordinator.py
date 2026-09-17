@@ -227,6 +227,21 @@ class CoordinatorTest(TestCase):
         other = Coordinator(self.budget, self.publish, namespace="test-environment", limits=self.coordinator.limits)
         self.assertEqual(other.reserve().plan.job_id, second.pk)
 
+    @override_settings(ASYNC_EXPORT_AGING_SECONDS=30)
+    def test_aging_prioritizes_long_waiting_job_over_recently_dispatched(self):
+        fresh, _ = self.ready()  # 较小 pk，最近刚投递
+        aged, _ = self.ready()  # 较大 pk，但已长时间没有获得投递
+        ExportJob.objects.filter(pk=fresh.pk).update(last_dispatched_at=timezone.now())
+        ExportJob.objects.filter(pk=aged.pk).update(last_dispatched_at=timezone.now() - timedelta(minutes=2))
+        self.assertEqual(self.coordinator.reserve().plan.job_id, aged.pk)
+
+    @override_settings(ASYNC_EXPORT_AGING_SECONDS=30)
+    def test_never_dispatched_job_gets_first_dispatch_priority(self):
+        dispatched, _ = self.ready()  # 较小 pk，最近刚投递
+        waiting, _ = self.ready()  # 较大 pk，从未投递过（last_dispatched_at 为 NULL）
+        ExportJob.objects.filter(pk=dispatched.pk).update(last_dispatched_at=timezone.now())
+        self.assertEqual(self.coordinator.reserve().plan.job_id, waiting.pk)
+
     def test_concurrent_lua_acquisition_never_exceeds_shared_index_limit(self):
         from concurrent.futures import ThreadPoolExecutor
 

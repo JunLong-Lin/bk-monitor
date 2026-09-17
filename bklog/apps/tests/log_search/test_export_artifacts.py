@@ -119,6 +119,17 @@ class ArtifactFlowTest(TestCase):
         checksum = hashlib.sha256(content).hexdigest()
         return Artifact(path, 1, len(content), len(content), checksum, checksum)
 
+    def test_cos_signing_checks_registered_storage(self):
+        record = Mock(storage_id="storage", object_key="exports/part.tar.gz")
+        self.client.get_presigned_download_url = Mock(return_value="https://cos.example.test/signed")
+        self.assertEqual(self.store.sign_download(record, 60), "https://cos.example.test/signed")
+        self.client.get_presigned_download_url.assert_called_once_with(
+            Bucket="bucket", Key=record.object_key, Expired=60
+        )
+        record.storage_id = "other"
+        with self.assertRaisesMessage(PartError, "ARTIFACT_STORAGE_CHANGED"):
+            self.store.sign_download(record, 60)
+
     def complete_parts(self):
         for part in self.plan.parts.order_by("part_no"):
             state.dispatch_part(
@@ -470,6 +481,7 @@ class BKRepoArtifactStoreTest(TestCase):
         self.job.refresh_from_db()
         return part, artifact
 
+    @override_settings(ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS=90)
     def test_part_manifest_and_cleanup_use_bkrepo(self):
         part, artifact = self.complete_part()
         part.refresh_from_db()
@@ -482,6 +494,8 @@ class BKRepoArtifactStoreTest(TestCase):
         manifest_key = self.store._key(result.manifest_object_key)
         manifest = json.loads(self.client.objects[manifest_key][0])
         self.assertEqual(manifest["actual_total"], 1)
+        self.assertEqual(manifest["expires_after_success_seconds"], 90)
+        self.assertLessEqual((result.expires_at - result.completed_at).total_seconds(), 90)
         ExportJob.objects.filter(pk=self.job.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
         self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
         self.assertEqual(self.client.objects, {})
@@ -538,6 +552,20 @@ class BKRepoArtifactStoreTest(TestCase):
         self.assertEqual(store.client.endpoint_url, "https://repo.example.test")
         self.assertEqual(store.client.project, "project")
         self.assertEqual(store.client.bucket, "bucket")
+
+    def test_bkrepo_signing_uses_temporary_download_token(self):
+        session = Mock()
+        session.post.return_value = Mock(
+            status_code=200,
+            json=lambda: {"code": 0, "data": [{"url": "https://repo.example.test/temporary/token"}]},
+        )
+        client = BKRepoHttpClient("https://repo.example.test", "project", "bucket", "user", "password", session)
+        self.assertEqual(client.sign_download("root/file", 60, 5), "https://repo.example.test/temporary/token")
+        self.assertEqual(session.post.call_args.kwargs["json"]["expireSeconds"], 60)
+        self.assertEqual(session.post.call_args.kwargs["json"]["type"], "DOWNLOAD")
+        session.post.return_value = Mock(status_code=404)
+        with self.assertRaisesMessage(PartError, "BKREPO_SIGN_FAILED"):
+            client.sign_download("root/file", 60, 5)
 
     def test_http_client_encodes_keys_and_sends_immutable_checksum_headers(self):
         received = []

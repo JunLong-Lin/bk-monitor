@@ -609,7 +609,7 @@ def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_
             error_detail="",
             next_finalization_at=None,
             completed_at=now,
-            expires_at=now + timedelta(hours=24),
+            expires_at=now + timedelta(seconds=settings.ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS),
             state_version=job.state_version + 1,
         )
 

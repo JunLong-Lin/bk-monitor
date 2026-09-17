@@ -3,7 +3,7 @@
 import base64
 import hashlib
 import json
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from django.conf import settings
@@ -98,6 +98,9 @@ class RegisteredArtifactStore:
     def delete(self, record, guard):
         raise NotImplementedError
 
+    def sign_download(self, record, expires_in):
+        raise NotImplementedError
+
 
 class CosArtifactStore(RegisteredArtifactStore):
     def __init__(self, client_factory, bucket, storage_id):
@@ -162,6 +165,12 @@ class CosArtifactStore(RegisteredArtifactStore):
         client = self.client_factory(min(guard(), settings.ASYNC_EXPORT_COS_TIMEOUT))
         client.delete_object(Bucket=self.bucket, Key=record.object_key)
 
+    def sign_download(self, record, expires_in):
+        if record.storage_id != self.storage_id:
+            raise PartError("ARTIFACT_STORAGE_CHANGED")
+        client = self.client_factory(settings.ASYNC_EXPORT_COS_TIMEOUT)
+        return client.get_presigned_download_url(Bucket=self.bucket, Key=record.object_key, Expired=expires_in)
+
 
 class BKRepoHttpClient:
     """按已安装的 BKRepo SDK 协议实现，并支持单次调用超时。"""
@@ -196,6 +205,32 @@ class BKRepoHttpClient:
 
     def delete(self, key, timeout):
         return self.session.delete(self._url(key), timeout=timeout)
+
+    def sign_download(self, key, expires_in, timeout):
+        response = self.session.post(
+            f"{self.endpoint_url}/generic/temporary/url/create",
+            json={
+                "projectId": self.project,
+                "repoName": self.bucket,
+                "fullPathSet": [key],
+                "expireSeconds": expires_in,
+                "type": "DOWNLOAD",
+            },
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            raise PartError("BKREPO_SIGN_FAILED")
+        try:
+            data = response.json()
+            if str(data.get("code")) != "0":
+                raise PartError("BKREPO_SIGN_FAILED")
+            url = data["data"][0]["url"]
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+                raise PartError("BKREPO_SIGN_FAILED")
+            return url
+        except (ValueError, KeyError, IndexError, TypeError) as error:
+            raise PartError("BKREPO_SIGN_FAILED") from error
 
 
 class BKRepoArtifactStore(RegisteredArtifactStore):
@@ -299,6 +334,11 @@ class BKRepoArtifactStore(RegisteredArtifactStore):
         data = self._data(response)
         if str(data.get("code")) not in {"0", *self.NOT_FOUND_CODES}:
             raise PartError("BKREPO_DELETE_FAILED")
+
+    def sign_download(self, record, expires_in):
+        if record.storage_id != self.storage_id:
+            raise PartError("ARTIFACT_STORAGE_CHANGED")
+        return self.client.sign_download(self._key(record.object_key), expires_in, settings.ASYNC_EXPORT_BKREPO_TIMEOUT)
 
 
 def cos_artifact_store():

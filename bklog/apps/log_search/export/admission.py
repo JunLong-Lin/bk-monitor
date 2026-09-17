@@ -24,6 +24,8 @@ def validate_runtime_configuration():
         "ASYNC_EXPORT_GLOBAL_LIMIT": settings.ASYNC_EXPORT_GLOBAL_LIMIT,
         "ASYNC_EXPORT_INDEX_LIMIT": settings.ASYNC_EXPORT_INDEX_LIMIT,
         "ASYNC_EXPORT_LEASE_SECONDS": settings.ASYNC_EXPORT_LEASE_SECONDS,
+        "ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS": settings.ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS,
+        "ASYNC_EXPORT_SIGNED_URL_SECONDS": settings.ASYNC_EXPORT_SIGNED_URL_SECONDS,
     }
     invalid.extend(name for name, value in positive_integers.items() if type(value) is not int or value <= 0)
     if invalid:

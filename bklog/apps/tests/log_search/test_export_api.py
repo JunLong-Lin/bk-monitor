@@ -10,11 +10,19 @@ from rest_framework.test import APIRequestFactory
 from rest_framework.routers import SimpleRouter
 
 from apps.log_search.export import state
-from apps.log_search.export.api import ExportConflict, authorized_job, job_detail, operate_job
-from apps.log_search.export.models import ExportJob, ExportPart
+from apps.log_search.export.api import (
+    ExportConflict,
+    ExportExpired,
+    authorized_job,
+    download_link,
+    job_detail,
+    job_results,
+    operate_job,
+)
+from apps.log_search.export.models import ExportArtifact, ExportJob, ExportPart
 from apps.log_search.models import LogIndexSet, Space
 from apps.tests.log_search.export_fixtures import create_job
-from apps.log_search.views.export_views import ExportJobViewSet, ExportParallelismSerializer
+from apps.log_search.views.export_views import ExportJobViewSet, ExportLinkSerializer, ExportParallelismSerializer
 
 
 @override_settings(ASYNC_EXPORT_INDEX_LIMIT=4, ASYNC_EXPORT_GLOBAL_LIMIT=16)
@@ -138,7 +146,14 @@ class ExportAPITest(TestCase):
         router.register("search/export_jobs", ExportJobViewSet, basename="export_jobs")
         self.assertEqual(
             {url.name for url in router.urls},
-            {"export_jobs-list", "export_jobs-detail", "export_jobs-cancel", "export_jobs-parallelism"},
+            {
+                "export_jobs-list",
+                "export_jobs-detail",
+                "export_jobs-cancel",
+                "export_jobs-parallelism",
+                "export_jobs-results",
+                "export_jobs-download-link",
+            },
         )
         for value in (0, 9, True, "bad", 1.5):
             serializer = ExportParallelismSerializer(data={"space_uid": "space", "requested_parallelism": value})
@@ -161,3 +176,93 @@ class ExportAPITest(TestCase):
         view.request = SimpleNamespace(method="POST", data={})
         with self.assertRaises(ValidationError):
             view.cancel(view.request, pk=str(self.job.pk))
+
+    @override_settings(ASYNC_EXPORT_SIGNED_URL_SECONDS=600)
+    def test_results_and_download_link_use_only_committed_artifacts(self):
+        plan = self.plan()
+        parts = list(plan.parts.order_by("part_no"))
+        for part in parts:
+            key = f"part-{part.pk}"
+            ExportPart.objects.filter(pk=part.pk).update(
+                status="SUCCESS",
+                actual_rows=3,
+                actual_bytes=10,
+                compressed_bytes=8,
+                object_key=key,
+                checksum="a" * 64,
+            )
+            ExportArtifact.objects.create(
+                job=self.job,
+                object_key=key,
+                storage_id="storage",
+                checksum="a" * 64,
+                size=8,
+                status="READY",
+            )
+        ExportArtifact.objects.create(
+            job=self.job,
+            object_key="manifest",
+            storage_id="storage",
+            checksum="b" * 64,
+            size=10,
+            status="READY",
+        )
+        ExportJob.objects.filter(pk=self.job.pk).update(
+            status="SUCCESS",
+            current_plan_version=plan.plan_version,
+            actual_total=6,
+            manifest_object_key="manifest",
+            manifest_checksum="b" * 64,
+            expires_at=timezone.now() + timedelta(seconds=90),
+        )
+        self.job.refresh_from_db()
+        result = job_results(self.job)
+        self.assertEqual([part["part_id"] for part in result["parts"]], [part.pk for part in parts])
+        self.assertNotIn("object_key", str(result))
+        store = SimpleNamespace(storage_id="storage", sign_download=lambda record, ttl: f"https://example.test/{ttl}")
+        with patch("apps.log_search.export.api.import_string", return_value=lambda: store):
+            link = download_link(self.job, str(parts[0].pk))
+            self.assertLessEqual(int(link["url"].rsplit("/", 1)[1]), 90)
+            self.assertEqual(download_link(self.job, "manifest")["url"].split("/")[-1], link["url"].split("/")[-1])
+        ExportArtifact.objects.filter(object_key=f"part-{parts[0].pk}").update(checksum="wrong")
+        with self.assertRaises(ExportConflict):
+            job_results(self.job)
+        ExportJob.objects.filter(pk=self.job.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
+        self.job.refresh_from_db()
+        with self.assertRaises(ExportExpired):
+            job_results(self.job)
+
+    def test_list_filters_by_current_permissions(self):
+        other = create_job(index_set_ids=[2], source_app_code="app")
+        request = APIRequestFactory().get("/", {"space_uid": "space"})
+        view = ExportJobViewSet.as_view({"get": "list"})
+
+        def authorize(_request, pk, _space):
+            if pk == other.pk:
+                raise PermissionDenied()
+            return self.job
+
+        with (
+            patch("apps.log_search.views.export_views.authorized_job", side_effect=authorize),
+            patch("apps.log_search.views.export_views.get_request_tenant_id", return_value="tenant"),
+            patch("apps.log_search.views.export_views.get_request_app_code", return_value="app"),
+        ):
+            response = view(request)
+        self.assertEqual([item["job_id"] for item in response.data["data"]["results"]], [self.job.pk])
+
+    def test_result_and_link_views_authorize_before_reading(self):
+        factory = APIRequestFactory()
+        result_view = ExportJobViewSet.as_view({"get": "results"})
+        link_view = ExportJobViewSet.as_view({"get": "download_link"}, serializer_class=ExportLinkSerializer)
+        with (
+            patch("apps.log_search.views.export_views.authorized_job", return_value=self.job) as authorize,
+            patch("apps.log_search.views.export_views.job_results", return_value={"parts": []}),
+            patch("apps.log_search.views.export_views.download_link", return_value={"url": "signed"}),
+        ):
+            response = result_view(factory.get("/", {"space_uid": "space"}), pk=str(self.job.pk))
+            self.assertEqual(response.data["data"], {"parts": []})
+            response = link_view(
+                factory.get("/", {"space_uid": "space", "artifact_id": "manifest"}), pk=str(self.job.pk)
+            )
+            self.assertEqual(response.data["data"], {"url": "signed"})
+            self.assertEqual(authorize.call_count, 2)

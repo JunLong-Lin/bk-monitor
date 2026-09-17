@@ -1,15 +1,19 @@
 """分片导出任务的授权元数据与操作接口。"""
 
+from datetime import timedelta
+
 from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.module_loading import import_string
 from rest_framework.exceptions import APIException, PermissionDenied
 
 from apps.iam import ActionEnum, ResourceEnum
 from apps.iam.handlers.drf import BusinessActionPermission, IAMPermission
 from apps.log_search.export import state
 from apps.log_search.export.contracts import InvalidTransitionError
-from apps.log_search.export.models import ExportJob, ExportPart
+from apps.log_search.export.models import ExportArtifact, ExportJob, ExportPart
+from apps.log_search.export.worker import PartError
 from apps.log_search.models import LogIndexSet, Space
 from apps.utils.local import get_request_app_code, get_request_tenant_id, get_request_username
 
@@ -22,6 +26,18 @@ class ExportConflict(APIException):
     status_code = 409
     default_detail = "EXPORT_INVALID_STATE"
     default_code = "EXPORT_INVALID_STATE"
+
+
+class ExportExpired(APIException):
+    status_code = 410
+    default_detail = "EXPORT_FILE_EXPIRED"
+    default_code = "EXPORT_FILE_EXPIRED"
+
+
+class ExportStorageUnavailable(APIException):
+    status_code = 503
+    default_detail = "EXPORT_STORAGE_UNAVAILABLE"
+    default_code = "EXPORT_STORAGE_UNAVAILABLE"
 
 
 def authorized_job(request, job_id, space_uid, *, operate=False):
@@ -109,6 +125,96 @@ def job_detail(job_id):
         "can_operate": job.created_by == get_request_username(default="") and job.status not in TERMINAL,
         "poll_after": None if job.status in TERMINAL else 3,
     }
+
+
+def job_results(job):
+    if job.status != ExportJob.Status.SUCCESS:
+        raise ExportConflict("EXPORT_NOT_READY")
+    if job.expires_at is None or job.expires_at <= timezone.now():
+        raise ExportExpired()
+    parts = list(
+        ExportPart.objects.filter(
+            plan__job=job,
+            plan__plan_version=job.current_plan_version,
+            is_leaf=True,
+            status=ExportPart.Status.SUCCESS,
+        ).order_by("start_time", "part_no")
+    )
+    if not parts or not job.manifest_object_key:
+        raise ExportConflict("EXPORT_RESULT_INCOMPLETE")
+    records = {
+        record.object_key: record
+        for record in ExportArtifact.objects.filter(job=job, status=ExportArtifact.Status.READY)
+    }
+    if (
+        job.manifest_object_key not in records
+        or records[job.manifest_object_key].checksum != job.manifest_checksum
+        or any(
+            part.object_key not in records
+            or records[part.object_key].checksum != part.checksum
+            or records[part.object_key].size != part.compressed_bytes
+            for part in parts
+        )
+    ):
+        raise ExportConflict("EXPORT_RESULT_INCOMPLETE")
+    return {
+        "job_id": job.pk,
+        "estimated_total": job.estimated_total,
+        "actual_total": job.actual_total,
+        "expires_at": job.expires_at,
+        "manifest": {
+            "artifact_id": "manifest",
+            "checksum": job.manifest_checksum,
+            "compressed_bytes": records[job.manifest_object_key].size,
+        },
+        "parts": [
+            {
+                "artifact_id": str(part.pk),
+                "part_id": part.pk,
+                "part_no": part.part_no,
+                "start_time": part.start_time,
+                "end_time": part.end_time,
+                "actual_rows": part.actual_rows,
+                "actual_bytes": part.actual_bytes,
+                "compressed_bytes": part.compressed_bytes,
+                "checksum": part.checksum,
+            }
+            for part in parts
+        ],
+    }
+
+
+def download_link(job, artifact_id):
+    # 先验证 Job 和有效期，再从该 Job 当前获胜的 Part 中选择对象。
+    job_results(job)
+    if artifact_id == "manifest":
+        key = job.manifest_object_key
+    else:
+        part = get_object_or_404(
+            ExportPart,
+            pk=int(artifact_id),
+            plan__job=job,
+            plan__plan_version=job.current_plan_version,
+            is_leaf=True,
+            status=ExportPart.Status.SUCCESS,
+        )
+        key = part.object_key
+    record = get_object_or_404(ExportArtifact, job=job, object_key=key, status=ExportArtifact.Status.READY)
+    signed_at = timezone.now()
+    remaining = int((job.expires_at - signed_at).total_seconds())
+    if remaining <= 0:
+        raise ExportExpired()
+    ttl = min(remaining, settings.ASYNC_EXPORT_SIGNED_URL_SECONDS)
+    if ttl <= 0 or not settings.ASYNC_EXPORT_ARTIFACT_STORE_FACTORY:
+        raise ExportStorageUnavailable()
+    try:
+        store = import_string(settings.ASYNC_EXPORT_ARTIFACT_STORE_FACTORY)()
+        if record.storage_id != store.storage_id:
+            raise PartError("ARTIFACT_STORAGE_CHANGED")
+        url = store.sign_download(record, ttl)
+    except Exception as error:
+        raise ExportStorageUnavailable() from error
+    return {"url": url, "expires_at": signed_at + timedelta(seconds=ttl)}
 
 
 def operate_job(job_id, *, parallelism=None):

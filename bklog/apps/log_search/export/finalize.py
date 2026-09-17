@@ -61,7 +61,7 @@ def manifest_snapshot(job):
         time_units_per_second=job.query_snapshot["time_units_per_second"],
         estimated_total=job.estimated_total,
         actual_total=job.actual_total,
-        expires_after_success_seconds=86400,
+        expires_after_success_seconds=settings.ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS,
         parts=entries,
     ), records
 

@@ -168,7 +168,12 @@ MIDDLEWARE = (
 
 # Resource Call owns an explicit, discoverable params schema. Avoid recursively
 # adding space fields to its opaque ``params`` envelope before schema validation.
-BKM_SPACE_INJECT_REQUEST_EXCLUDED_PATHS = ("/api/v1/admin/resource/call/",)
+# 分片导出创建接口同样使用严格的显式字段校验，空间字段由服务端自行解析，
+# 因此排除注入，避免自动补充的 bk_biz_id 触发 EXPORT_UNKNOWN_FIELDS。
+BKM_SPACE_INJECT_REQUEST_EXCLUDED_PATHS = (
+    "/api/v1/admin/resource/call/",
+    "/api/v1/search/export_jobs/",
+)
 
 # 所有环境的日志级别可以在这里配置
 # LOG_LEVEL = 'INFO'
@@ -232,6 +237,7 @@ CELERY_IMPORTS = (
     "apps.log_search.tasks.async_export",
     "apps.log_search.tasks.scene_async_export",
     "apps.log_search.tasks.unify_query_async_export",
+    "apps.log_search.tasks.sharded_export",
     "apps.log_search.tasks.project",
     "apps.log_search.tasks.space",
     "apps.log_search.tasks.cmdb",
@@ -1402,6 +1408,70 @@ TGPA_SDK_DOC_URL = os.getenv("BKAPP_TGPA_SDK_DOC_URL", "")
 
 # 异步下载最大并发任务数
 MAX_CONCURRENT_EXPORT_TASKS = int(os.getenv("BKAPP_MAX_CONCURRENT_EXPORT_TASKS", 3))
+
+# 异步分片导出的资源与故障恢复预算；实际容量仍需按部署环境验证。
+ASYNC_EXPORT_MAX_ATTEMPTS = int(os.getenv("BKAPP_ASYNC_EXPORT_MAX_ATTEMPTS", 3))
+ASYNC_EXPORT_MAX_LEAF_PARTS = int(os.getenv("BKAPP_ASYNC_EXPORT_MAX_LEAF_PARTS", 500))
+# 新链路在协议、容量验证与 Worker 集成完成前保持关闭。
+ASYNC_EXPORT_SHARDED_ENABLED = os.getenv("BKAPP_ASYNC_EXPORT_SHARDED_ENABLED", "off") == "on"
+# 创建准入与控制处理分开，这样回退时关闭新任务创建不会搁置已准入的 Job。
+ASYNC_EXPORT_CONTROL_ENABLED = os.getenv("BKAPP_ASYNC_EXPORT_CONTROL_ENABLED", "off") == "on"
+ASYNC_EXPORT_VERIFIED_QUERY_KINDS = []
+# 只有对应边界协议验证通过后才配置，不提供隐式默认值。
+ASYNC_EXPORT_QUERY_END_MODES = {}
+ASYNC_EXPORT_ADAPTER_FACTORY = "apps.log_search.export.adapter.native_query_factory"
+ASYNC_EXPORT_PART_TASK = "apps.log_search.tasks.sharded_export.execute_sharded_export_part"
+ASYNC_EXPORT_ARTIFACT_STORE_FACTORY = ""
+ASYNC_EXPORT_LOCAL_ARTIFACT_ROOT = ""
+ASYNC_EXPORT_WORKER_POLICY = {}
+ASYNC_EXPORT_PART_RETRY_SECONDS = 10
+ASYNC_EXPORT_COS = {}  # Bucket、Region、SecretId、SecretKey；凭据绝不写入 Job 快照。
+ASYNC_EXPORT_COS_TIMEOUT = 15
+ASYNC_EXPORT_COS_PUT_ATTEMPTS = 3
+ASYNC_EXPORT_BKREPO_TIMEOUT = 15
+ASYNC_EXPORT_BKREPO_PUT_ATTEMPTS = 3
+ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS = int(os.getenv("BKAPP_ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS", 86400))
+ASYNC_EXPORT_SIGNED_URL_SECONDS = int(os.getenv("BKAPP_ASYNC_EXPORT_SIGNED_URL_SECONDS", 600))
+ASYNC_EXPORT_FINALIZATION_ATTEMPTS = 3
+ASYNC_EXPORT_FINALIZATION_DEADLINE = 120
+ASYNC_EXPORT_FINALIZATION_RETRY = 10
+ASYNC_EXPORT_CLEANUP_DEADLINE = 30
+ASYNC_EXPORT_TEMP_ROOT = ""  # 仅本地磁盘；默认使用操作系统临时目录。
+ASYNC_EXPORT_TEMP_RETENTION_SECONDS = 3600
+ASYNC_EXPORT_FINALIZE_TASK = ""
+ASYNC_EXPORT_QUEUE = "sharded_async_export"
+ASYNC_EXPORT_OVERSIZED_QUEUE = "sharded_async_export_oversized"
+ASYNC_EXPORT_CONTROL_QUEUE = "sharded_async_export_control"
+ASYNC_EXPORT_NAMESPACE = os.getenv(
+    "BKAPP_ASYNC_EXPORT_NAMESPACE", f"{APP_CODE}:{os.getenv('BKPAAS_ENVIRONMENT', 'dev')}:sharded-export"
+)
+ASYNC_EXPORT_GLOBAL_LIMIT = int(os.getenv("BKAPP_ASYNC_EXPORT_GLOBAL_LIMIT", 0))
+ASYNC_EXPORT_INDEX_LIMIT = int(os.getenv("BKAPP_ASYNC_EXPORT_INDEX_LIMIT", 4))
+ASYNC_EXPORT_OVERSIZED_LIMIT = int(os.getenv("BKAPP_ASYNC_EXPORT_OVERSIZED_LIMIT", 0))
+# 必须在实测有界 I/O 之后配置；为 0 时不投递新分片。
+ASYNC_EXPORT_LEASE_SECONDS = int(os.getenv("BKAPP_ASYNC_EXPORT_LEASE_SECONDS", 0))
+ASYNC_EXPORT_SCAN_LIMIT = 100
+# 公平调度 aging 阈值：活跃 Job 超过该时长未获得任何分片投递时，插队优先调度，
+# 避免在大规模轮转或共享索引预算争用时被长期饿死。为 0 时关闭 aging。
+ASYNC_EXPORT_AGING_SECONDS = int(os.getenv("BKAPP_ASYNC_EXPORT_AGING_SECONDS", 30))
+ASYNC_EXPORT_PLANNING_ATTEMPTS = 3
+ASYNC_EXPORT_PLANNING_DEADLINE = 600
+ASYNC_EXPORT_PLANNING_LEASE_SECONDS = 60
+ASYNC_EXPORT_PLANNING_RETRY_SECONDS = 10
+ASYNC_EXPORT_PLANNER_POLICY = {}
+ASYNC_EXPORT_COORDINATE_INTERVAL_SECONDS = 10
+
+# 分片导出的周期控制任务：补回缺失的规划、投递、拆分与收尾消息，并回收过期投递。
+# 任务内部按 ASYNC_EXPORT_CONTROL_ENABLED 自行短路，未启用新链路时不产生实际工作。
+# 走 CELERYBEAT_SCHEDULE 而非 @periodic_task，是因为只有前者的 options.queue 会被
+# DatabaseScheduler 落库到 django_celery_beat_periodictask.queue。
+CELERYBEAT_SCHEDULE = {
+    "coordinate_sharded_exports": {
+        "task": "apps.log_search.tasks.sharded_export.coordinate_sharded_exports",
+        "schedule": ASYNC_EXPORT_COORDINATE_INTERVAL_SECONDS,
+        "options": {"queue": ASYNC_EXPORT_CONTROL_QUEUE},
+    },
+}
 
 """
 以下为框架代码 请勿修改

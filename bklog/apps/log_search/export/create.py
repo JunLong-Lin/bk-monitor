@@ -18,6 +18,7 @@ from apps.log_search.handlers.search.search_handlers_esquery import SearchHandle
 from apps.log_search.models import AsyncTask
 from apps.log_unifyquery.handler.base import UnifyQueryHandler
 from apps.utils.local import (
+    get_local_param,
     get_request_app_code,
     get_request_external_username,
     get_request_username,
@@ -71,7 +72,10 @@ def create_export(request, data):
     context = SimpleNamespace(
         **identity,
         source_app_code=source_app,
-        query_snapshot={"search_params": params, "unify_query": {"timezone": data["time_zone"]}},
+        query_snapshot={
+            "search_params": params,
+            "unify_query": {"timezone": get_local_param("time_zone", settings.TIME_ZONE)},
+        },
     )
     with export_identity(context):
         handler = UnifyQueryHandler(deepcopy(params))

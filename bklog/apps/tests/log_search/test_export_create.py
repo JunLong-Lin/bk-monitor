@@ -1,6 +1,7 @@
 from copy import deepcopy
 from unittest.mock import Mock, patch
 
+from django.conf import settings
 from django.test import TestCase, SimpleTestCase, override_settings
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.test import APIRequestFactory
@@ -48,18 +49,18 @@ class CreateInputTest(SimpleTestCase):
             "custom_indices",
             "size",
             "begin",
+            "time_zone",
         ):
             with self.subTest(key=key), self.assertRaises(ValidationError):
                 inputs(**{key: {}})
 
-    def test_invalid_ranges_sort_timezone_and_fields(self):
+    def test_invalid_ranges_sort_and_fields(self):
         for extra in (
             {"start_time": "now-1h"},
             {"end_time": 0},
             {"start_time": 1700000060000},
             {"sort_list": [["a"]]},
             {"sort_list": [["a", "wrong"]]},
-            {"time_zone": "bad-zone"},
             {"requested_parallelism": 9},
             {"export_fields": [{}]},
             {"addition": [{"field": "x", "operator": "is", "value": {}}]},
@@ -108,14 +109,14 @@ class CreateExportTest(TestCase):
     def handler(self, params):
         self.assertEqual(get_request().user.username, "alice")
         self.assertEqual(get_request().META["HTTP_X_BK_TENANT_ID"], "tenant")
-        self.assertEqual(get_local_param("time_zone"), "UTC")
+        self.assertEqual(get_local_param("time_zone"), settings.TIME_ZONE)
         sort = params.get("sort_list") or [["timestamp", "desc"]]
         self.last_handler = Mock(
             base_dict={
                 "query_list": [{"table_id": "fixed-label", "reference_name": "a", "conditions": {}}],
                 "start_time": str(params["start_time"]),
                 "end_time": str(params["end_time"]),
-                "timezone": "UTC",
+                "timezone": settings.TIME_ZONE,
                 "bk_biz_id": 2,
                 "order_by": ["-timestamp"],
             },

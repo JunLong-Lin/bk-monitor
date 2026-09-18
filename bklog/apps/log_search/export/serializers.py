@@ -1,6 +1,5 @@
 """新协议的显式入参；内部快照永远不作为客户端输入。"""
 
-import pytz
 from rest_framework import serializers
 
 
@@ -32,7 +31,6 @@ class ExportCreateSerializer(StrictSerializer):
     # 相对时间与隐式单位推断一律拒绝。
     start_time = serializers.IntegerField(min_value=0, max_value=253402300799000)
     end_time = serializers.IntegerField(min_value=1, max_value=253402300799000)
-    time_zone = serializers.CharField(default="UTC")
     keyword = serializers.CharField(default="*", allow_blank=True)
     addition = ExportAdditionSerializer(many=True, default=list)
     ip_chooser = serializers.DictField(default=dict)
@@ -40,12 +38,6 @@ class ExportCreateSerializer(StrictSerializer):
     export_fields = serializers.ListField(child=serializers.CharField(), default=list)
     file_type = serializers.ChoiceField(choices=["log", "txt"], default="log")
     requested_parallelism = serializers.IntegerField(min_value=1, max_value=8, default=4)
-
-    def validate_time_zone(self, value):
-        try:
-            return pytz.timezone(value).zone
-        except pytz.UnknownTimeZoneError as error:
-            raise serializers.ValidationError("Invalid time zone.") from error
 
     def validate_sort_list(self, value):
         if any(len(item) != 2 or item[1] not in {"asc", "desc"} for item in value):

@@ -20,7 +20,7 @@ from apps.log_search.export.api import (
     job_results,
     operate_job,
 )
-from apps.log_search.export.models import ExportArtifact, ExportJob, ExportPart
+from apps.log_search.export.models import ExportJob, ExportPart
 from apps.log_search.models import LogIndexSet, Space
 from apps.tests.log_search.export_fixtures import create_job
 from apps.log_search.views.export_views import ExportJobViewSet, ExportLinkSerializer, ExportParallelismSerializer
@@ -196,28 +196,13 @@ class ExportAPITest(TestCase):
                 object_key=key,
                 checksum="a" * 64,
             )
-            ExportArtifact.objects.create(
-                job=self.job,
-                object_key=key,
-                storage_id="storage",
-                checksum="a" * 64,
-                size=8,
-                status="READY",
-            )
-        ExportArtifact.objects.create(
-            job=self.job,
-            object_key="manifest",
-            storage_id="storage",
-            checksum="b" * 64,
-            size=10,
-            status="READY",
-        )
         ExportJob.objects.filter(pk=self.job.pk).update(
             status="SUCCESS",
             current_plan_version=plan.plan_version,
             actual_total=6,
             manifest_object_key="manifest",
             manifest_checksum="b" * 64,
+            manifest_bytes=10,
             expires_at=timezone.now() + timedelta(seconds=90),
         )
         self.job.refresh_from_db()
@@ -229,7 +214,7 @@ class ExportAPITest(TestCase):
             link = download_link(self.job, str(parts[0].pk))
             self.assertLessEqual(int(link["url"].rsplit("/", 1)[1]), 90)
             self.assertEqual(download_link(self.job, "manifest")["url"].split("/")[-1], link["url"].split("/")[-1])
-        ExportArtifact.objects.filter(object_key=f"part-{parts[0].pk}").update(checksum="wrong")
+        ExportPart.objects.filter(pk=parts[0].pk).update(checksum="")
         with self.assertRaises(ExportConflict):
             job_results(self.job)
         ExportJob.objects.filter(pk=self.job.pk).update(expires_at=timezone.now() - timedelta(seconds=1))

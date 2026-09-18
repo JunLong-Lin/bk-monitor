@@ -12,8 +12,7 @@ from apps.iam import ActionEnum, ResourceEnum
 from apps.iam.handlers.drf import BusinessActionPermission, IAMPermission
 from apps.log_search.export import state
 from apps.log_search.export.contracts import InvalidTransitionError
-from apps.log_search.export.models import ExportArtifact, ExportJob, ExportPart
-from apps.log_search.export.worker import PartError
+from apps.log_search.export.models import ExportJob, ExportPart
 from apps.log_search.models import LogIndexSet, Space
 from apps.utils.local import get_request_app_code, get_request_tenant_id, get_request_username
 
@@ -141,20 +140,7 @@ def job_results(job):
     )
     if not parts or not job.manifest_object_key:
         raise ExportConflict("EXPORT_RESULT_INCOMPLETE")
-    records = {
-        record.object_key: record
-        for record in ExportArtifact.objects.filter(job=job, status=ExportArtifact.Status.READY)
-    }
-    if (
-        job.manifest_object_key not in records
-        or records[job.manifest_object_key].checksum != job.manifest_checksum
-        or any(
-            part.object_key not in records
-            or records[part.object_key].checksum != part.checksum
-            or records[part.object_key].size != part.compressed_bytes
-            for part in parts
-        )
-    ):
+    if not job.manifest_checksum or any(not part.object_key or not part.checksum for part in parts):
         raise ExportConflict("EXPORT_RESULT_INCOMPLETE")
     return {
         "job_id": job.pk,
@@ -164,7 +150,7 @@ def job_results(job):
         "manifest": {
             "artifact_id": "manifest",
             "checksum": job.manifest_checksum,
-            "compressed_bytes": records[job.manifest_object_key].size,
+            "compressed_bytes": job.manifest_bytes,
         },
         "parts": [
             {
@@ -198,7 +184,6 @@ def download_link(job, artifact_id):
             status=ExportPart.Status.SUCCESS,
         )
         key = part.object_key
-    record = get_object_or_404(ExportArtifact, job=job, object_key=key, status=ExportArtifact.Status.READY)
     signed_at = timezone.now()
     remaining = int((job.expires_at - signed_at).total_seconds())
     if remaining <= 0:
@@ -208,9 +193,7 @@ def download_link(job, artifact_id):
         raise ExportStorageUnavailable()
     try:
         store = import_string(settings.ASYNC_EXPORT_ARTIFACT_STORE_FACTORY)()
-        if record.storage_id != store.storage_id:
-            raise PartError("ARTIFACT_STORAGE_CHANGED")
-        url = store.sign_download(record, ttl)
+        url = store.sign_download(key, ttl)
     except Exception as error:
         raise ExportStorageUnavailable() from error
     return {"url": url, "expires_at": signed_at + timedelta(seconds=ttl)}

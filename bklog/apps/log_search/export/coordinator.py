@@ -332,8 +332,8 @@ class Coordinator:
     def cleanup_jobs(self, limit=100):
         jobs = ExportJob.objects.filter(
             status__in=[ExportJob.Status.SUCCESS, ExportJob.Status.FAILED, ExportJob.Status.CANCELED],
-            artifacts__status="READY",
-        ).distinct()
+            artifacts_cleaned_at__isnull=True,
+        )
         return [job.pk for job in self._batch(jobs, "artifact_cleanup", limit)]
 
     def control_work(self, limit=100, *, finalize=False):

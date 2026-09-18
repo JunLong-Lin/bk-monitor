@@ -1,18 +1,18 @@
-"""已登记的不可变导出产物，上传时不做任何过期设置。"""
+"""分片与清单产物的上传和校验。"""
 
 import base64
 import hashlib
 import json
+from dataclasses import dataclass
 from urllib.parse import quote, urlparse
 
 import requests
 from django.conf import settings
-from django.db import transaction
 from qcloud_cos import CosConfig, CosS3Client
 from qcloud_cos.cos_exception import CosServiceError
 from requests.auth import HTTPBasicAuth
 
-from apps.log_search.export.models import ExportArtifact, ExportJob
+from apps.log_search.export.models import ExportJob
 from apps.log_search.export.worker import CheckedFile, PartError, UnconfirmedQueryExit
 
 
@@ -21,70 +21,50 @@ def artifact_prefix(job):
     return f"exports/{hashlib.sha256(scope.encode()).hexdigest()}/{job.pk}/"
 
 
-class RegisteredArtifactStore:
-    """与具体存储无关的登记、不可变与恢复规则。"""
+@dataclass(frozen=True)
+class StoredArtifact:
+    object_key: str
+    checksum: str
+    content_checksum: str
+    size: int
+    storage_id: str
+
+
+class ArtifactStore:
+    """与具体存储无关的上传和校验规则。"""
 
     def __init__(self, storage_id):
         self.storage_id = storage_id
 
     def publish(self, part, artifact, guard):
-        key = f"{artifact_prefix(part.plan.job)}{part.plan.plan_version}/{part.pk}/{artifact.checksum}.tar.gz"
+        key = (
+            f"{artifact_prefix(part.plan.job)}{part.plan.plan_version}/{part.pk}/"
+            f"{part.dispatch_generation}/{artifact.checksum}.tar.gz"
+        )
         return self.publish_file(part.plan.job, key, artifact, guard)
 
     def publish_file(self, job, key, artifact, guard):
         guard()
-        with transaction.atomic():
-            current = ExportJob.objects.select_for_update().get(pk=job.pk)
-            if current.status != ExportJob.Status.RUNNING or not key.startswith(artifact_prefix(current)):
-                raise PartError("JOB_STOPPED")
-            record, created = ExportArtifact.objects.get_or_create(
-                object_key=key,
-                defaults=dict(
-                    job=current,
-                    checksum=artifact.checksum,
-                    content_checksum=artifact.content_checksum,
-                    size=artifact.compressed_size,
-                    storage_id=self.storage_id,
-                ),
-            )
-            if (record.job_id, record.checksum, record.size, record.storage_id, record.content_checksum) != (
-                job.pk,
-                artifact.checksum,
-                artifact.compressed_size,
-                self.storage_id,
-                artifact.content_checksum,
-            ):
-                raise PartError("ARTIFACT_IDENTITY_MISMATCH")
-            if not created and record.status != ExportArtifact.Status.READY:
-                raise PartError("ARTIFACT_UPLOAD_PENDING")
-            # READY 是不可变且可直接复用的；若在 HEAD 之前降级，
-            # Worker 崩溃就会把有效对象变成无法恢复的 UPLOADING 标记。
-        uncertain = False
-        try:
-            existing = self.head(key, guard)
-            if existing is None:
-                md5 = hashlib.md5()  # 传输校验，不用于身份或安全判定。
-                sha256 = hashlib.sha256()
-                with artifact.path.open("rb") as stream:
-                    reader = CheckedFile(stream, guard)
-                    while block := reader.read(1024 * 1024):
-                        md5.update(block)
-                        sha256.update(block)
-                if sha256.hexdigest() != record.checksum:
-                    raise PartError("LOCAL_ARTIFACT_CHANGED")
-                self.upload(record, artifact, guard, md5.digest())
-            self.verify(record, guard)
-            return key
-        except UnconfirmedQueryExit:
-            uncertain = True
-            raise
-        finally:
-            # 已完成或从未开始的 PUT 可以在终态后清理；
-            # 结果不确定的 PUT 会永久保留其持久化标记。
-            if not uncertain:
-                ExportArtifact.objects.filter(pk=record.pk, status=ExportArtifact.Status.UPLOADING).update(
-                    status=ExportArtifact.Status.READY
-                )
+        current = ExportJob.objects.get(pk=job.pk)
+        if current.status != ExportJob.Status.RUNNING or not key.startswith(artifact_prefix(current)):
+            raise PartError("JOB_STOPPED")
+        record = StoredArtifact(
+            key, artifact.checksum, artifact.content_checksum, artifact.compressed_size, self.storage_id
+        )
+        existing = self.head(key, guard)
+        if existing is None:
+            md5 = hashlib.md5()  # 传输校验，不用于身份或安全判定。
+            sha256 = hashlib.sha256()
+            with artifact.path.open("rb") as stream:
+                reader = CheckedFile(stream, guard)
+                while block := reader.read(1024 * 1024):
+                    md5.update(block)
+                    sha256.update(block)
+            if sha256.hexdigest() != record.checksum:
+                raise PartError("LOCAL_ARTIFACT_CHANGED")
+            self.upload(record, artifact, guard, md5.digest())
+        self.verify(record, guard)
+        return key
 
     def head(self, key, guard):
         raise NotImplementedError
@@ -98,11 +78,11 @@ class RegisteredArtifactStore:
     def delete(self, record, guard):
         raise NotImplementedError
 
-    def sign_download(self, record, expires_in):
+    def sign_download(self, key, expires_in):
         raise NotImplementedError
 
 
-class CosArtifactStore(RegisteredArtifactStore):
+class CosArtifactStore(ArtifactStore):
     def __init__(self, client_factory, bucket, storage_id):
         if any(
             type(value) is not int or value <= 0
@@ -165,11 +145,9 @@ class CosArtifactStore(RegisteredArtifactStore):
         client = self.client_factory(min(guard(), settings.ASYNC_EXPORT_COS_TIMEOUT))
         client.delete_object(Bucket=self.bucket, Key=record.object_key)
 
-    def sign_download(self, record, expires_in):
-        if record.storage_id != self.storage_id:
-            raise PartError("ARTIFACT_STORAGE_CHANGED")
+    def sign_download(self, key, expires_in):
         client = self.client_factory(settings.ASYNC_EXPORT_COS_TIMEOUT)
-        return client.get_presigned_download_url(Bucket=self.bucket, Key=record.object_key, Expired=expires_in)
+        return client.get_presigned_download_url(Bucket=self.bucket, Key=key, Expired=expires_in)
 
 
 class BKRepoHttpClient:
@@ -233,7 +211,7 @@ class BKRepoHttpClient:
             raise PartError("BKREPO_SIGN_FAILED") from error
 
 
-class BKRepoArtifactStore(RegisteredArtifactStore):
+class BKRepoArtifactStore(ArtifactStore):
     NOT_FOUND_CODES = {"250102", "251010"}
     OBJECT_EXISTS_CODES = {"250107", "251012"}
 
@@ -335,10 +313,8 @@ class BKRepoArtifactStore(RegisteredArtifactStore):
         if str(data.get("code")) not in {"0", *self.NOT_FOUND_CODES}:
             raise PartError("BKREPO_DELETE_FAILED")
 
-    def sign_download(self, record, expires_in):
-        if record.storage_id != self.storage_id:
-            raise PartError("ARTIFACT_STORAGE_CHANGED")
-        return self.client.sign_download(self._key(record.object_key), expires_in, settings.ASYNC_EXPORT_BKREPO_TIMEOUT)
+    def sign_download(self, key, expires_in):
+        return self.client.sign_download(self._key(key), expires_in, settings.ASYNC_EXPORT_BKREPO_TIMEOUT)
 
 
 def cos_artifact_store():

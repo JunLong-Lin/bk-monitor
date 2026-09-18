@@ -82,6 +82,8 @@ class ExportJob(PlanningRecord):
     state_version = models.PositiveBigIntegerField(_("状态更新版本"), default=0)
     manifest_object_key = models.CharField(_("有效清单对象键"), max_length=1024, blank=True, default="")
     manifest_checksum = models.CharField(_("清单SHA256"), max_length=64, blank=True, default="")
+    manifest_bytes = models.PositiveBigIntegerField(_("清单字节数"), null=True, blank=True)
+    artifacts_cleaned_at = models.DateTimeField(_("产物清理完成时间"), null=True, blank=True)
     finalization_attempts = models.PositiveIntegerField(default=0)
     next_finalization_at = models.DateTimeField(null=True, blank=True)
     started_at = models.DateTimeField(_("开始时间"), null=True, blank=True)
@@ -168,6 +170,7 @@ class ExportPart(PlanningRecord):
     worker_id = models.CharField(_("执行进程标识"), max_length=255, blank=True, default="")
     object_key = models.CharField(_("获胜产物对象键"), max_length=1024, blank=True, default="")
     checksum = models.CharField(_("获胜产物SHA256"), max_length=64, blank=True, default="")
+    content_checksum = models.CharField(_("日志内容SHA256"), max_length=64, blank=True, default="")
     published_at = models.DateTimeField(_("消息发布时间"), null=True, blank=True)
     started_at = models.DateTimeField(_("本次执行开始时间"), null=True, blank=True)
     finished_at = models.DateTimeField(_("本次执行完成时间"), null=True, blank=True)
@@ -217,23 +220,3 @@ class ExportDispatchGate(models.Model):
 
     class Meta:
         db_table = "log_export_dispatch_gate"
-
-
-class ExportArtifact(ExportRecord):
-    """远端 I/O 之前先登记；状态未知的上传永远不被当作空闲处理。"""
-
-    class Status(models.TextChoices):
-        UPLOADING = "UPLOADING", _("上传中")
-        READY = "READY", _("就绪")
-
-    job = models.ForeignKey(ExportJob, on_delete=models.PROTECT, related_name="artifacts")
-    object_key = models.CharField(max_length=255, unique=True)
-    storage_id = models.CharField(max_length=64)
-    checksum = models.CharField(max_length=64)
-    content_checksum = models.CharField(max_length=64, blank=True, default="")
-    size = models.PositiveBigIntegerField()
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.UPLOADING)
-
-    class Meta:
-        db_table = "log_export_artifact"
-        indexes = [models.Index(fields=["job", "status"], name="export_artifact_cleanup")]

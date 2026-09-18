@@ -119,16 +119,11 @@ class ArtifactFlowTest(TestCase):
         checksum = hashlib.sha256(content).hexdigest()
         return Artifact(path, 1, len(content), len(content), checksum, checksum)
 
-    def test_cos_signing_checks_registered_storage(self):
-        record = Mock(storage_id="storage", object_key="exports/part.tar.gz")
+    def test_cos_signing_uses_committed_key(self):
+        key = "exports/part.tar.gz"
         self.client.get_presigned_download_url = Mock(return_value="https://cos.example.test/signed")
-        self.assertEqual(self.store.sign_download(record, 60), "https://cos.example.test/signed")
-        self.client.get_presigned_download_url.assert_called_once_with(
-            Bucket="bucket", Key=record.object_key, Expired=60
-        )
-        record.storage_id = "other"
-        with self.assertRaisesMessage(PartError, "ARTIFACT_STORAGE_CHANGED"):
-            self.store.sign_download(record, 60)
+        self.assertEqual(self.store.sign_download(key, 60), "https://cos.example.test/signed")
+        self.client.get_presigned_download_url.assert_called_once_with(Bucket="bucket", Key=key, Expired=60)
 
     def complete_parts(self):
         for part in self.plan.parts.order_by("part_no"):
@@ -150,6 +145,7 @@ class ArtifactFlowTest(TestCase):
                 compressed_bytes=artifact.compressed_size,
                 object_key=key,
                 checksum=artifact.checksum,
+                content_checksum=artifact.content_checksum,
             )
         self.job.refresh_from_db()
 
@@ -176,6 +172,17 @@ class ArtifactFlowTest(TestCase):
         self.assertEqual(self.store.publish(part, artifact, lambda: 30), part.object_key)
         self.assertEqual(self.client.puts, puts)
 
+    def test_retry_generation_uses_another_object_key(self):
+        self.complete_parts()
+        part = self.plan.parts.first()
+        artifact = self.artifact(str(part.pk).encode())
+        original_key = part.object_key
+        part.dispatch_generation += 1
+        retry_key = self.store.publish(part, artifact, lambda: 30)
+        self.assertNotEqual(retry_key, original_key)
+        self.assertIn(original_key, self.client.objects)
+        self.assertIn(retry_key, self.client.objects)
+
     def test_ready_artifact_stays_recoverable_when_reuse_head_fails(self):
         self.complete_parts()
         part = self.plan.parts.first()
@@ -183,7 +190,6 @@ class ArtifactFlowTest(TestCase):
         with patch.object(self.store, "head", side_effect=TimeoutError()):
             with self.assertRaises(TimeoutError):
                 self.store.publish(part, artifact, lambda: 30)
-        self.assertEqual(self.job.artifacts.get(object_key=part.object_key).status, "READY")
         self.assertEqual(self.store.publish(part, artifact, lambda: 30), part.object_key)
 
     def test_cancel_during_manifest_upload_fences_commit_then_cleans(self):
@@ -200,29 +206,39 @@ class ArtifactFlowTest(TestCase):
         self.job.refresh_from_db()
         self.assertEqual(self.job.status, ExportJob.Status.CANCELED)
         self.assertFalse(self.job.manifest_object_key)
-        self.assertEqual(cleanup_export(self.job.pk, self.store), 3)
-        self.assertEqual(self.client.objects, {})
+        self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
+        self.assertEqual(len(self.client.objects), 1)
 
-    def test_orphans_only_before_expiry_all_objects_after_expiry(self):
+    def test_success_objects_are_removed_after_expiry(self):
         self.complete_parts()
         artifact = self.artifact(b"orphan")
         self.store.publish_file(self.job, artifact_prefix(self.job) + "unused", artifact, lambda: 30)
         finalize_export(self.job.pk, self.store)
-        self.assertEqual(cleanup_export(self.job.pk, self.store), 1)
-        self.assertEqual(len(self.client.objects), 3)
+        self.assertEqual(cleanup_export(self.job.pk, self.store), 0)
+        self.assertEqual(len(self.client.objects), 4)
         ExportJob.objects.filter(pk=self.job.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
         self.assertEqual(cleanup_export(self.job.pk, self.store), 3)
+        self.assertEqual(len(self.client.objects), 1)
         self.assertEqual(cleanup_export(self.job.pk, self.store), 0)
 
-    def test_unknown_upload_is_not_cleaned_or_retried_as_idle(self):
+    def test_expired_cleanup_progresses_in_batches(self):
+        self.complete_parts()
+        finalize_export(self.job.pk, self.store)
+        ExportJob.objects.filter(pk=self.job.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
+        self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 1)
+        self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 1)
+        self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 1)
+        self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 0)
+        self.assertEqual(self.client.objects, {})
+
+    def test_unknown_upload_does_not_create_success_record(self):
         self.complete_parts()
         artifact = self.artifact(b"uncertain")
         with patch.object(self.client, "put_object", side_effect=TimeoutError()):
             with self.assertRaises(UnconfirmedQueryExit):
                 self.store.publish_file(self.job, artifact_prefix(self.job) + "uncertain", artifact, lambda: 30)
-        self.assertTrue(self.job.artifacts.filter(status="UPLOADING").exists())
         state.cancel_job(self.job.pk)
-        self.assertEqual(cleanup_export(self.job.pk, self.store), 0)
+        self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
 
     def test_delete_response_loss_retries_without_republishing(self):
         self.complete_parts()
@@ -235,9 +251,9 @@ class ArtifactFlowTest(TestCase):
 
         with patch.object(self.client, "delete_object", side_effect=lost_response):
             self.assertEqual(cleanup_export(self.job.pk, self.store), 0)
-        self.assertEqual(self.job.artifacts.filter(status="READY").count(), 2)
         self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
-        self.assertFalse(self.job.artifacts.exists())
+        self.job.refresh_from_db()
+        self.assertIsNotNone(self.job.artifacts_cleaned_at)
 
     def test_manifest_failure_retries_only_finalization(self):
         self.complete_parts()
@@ -290,13 +306,14 @@ class ArtifactFlowTest(TestCase):
             self.store.publish_file(self.job, artifact_prefix(self.job) + "retry", artifact, lambda: 30)
         self.assertEqual(calls, 3)
 
-    def test_failed_delete_does_not_starve_later_objects(self):
+    def test_failed_delete_is_retried(self):
         self.complete_parts()
         state.cancel_job(self.job.pk)
         with patch.object(self.client, "delete_object", side_effect=TimeoutError()):
-            self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 0)
-        self.assertEqual(cleanup_export(self.job.pk, self.store, limit=1), 1)
-        self.assertEqual(self.job.artifacts.count(), 1)
+            self.assertEqual(cleanup_export(self.job.pk, self.store), 0)
+        self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
+        self.job.refresh_from_db()
+        self.assertIsNotNone(self.job.artifacts_cleaned_at)
 
     def test_finalization_attempts_exhaust_without_reexport(self):
         self.complete_parts()
@@ -360,7 +377,11 @@ class ArtifactFlowTest(TestCase):
             store = CosArtifactStore(lambda timeout: sdk, "fixture-1250000000", "wire")
             artifact = self.artifact(b"sdk-wire-data")
             key = store.publish_file(self.job, artifact_prefix(self.job) + "wire", artifact, lambda: 2)
-            record = self.job.artifacts.get(object_key=key)
+            from apps.log_search.export.storage import StoredArtifact
+
+            record = StoredArtifact(
+                key, artifact.checksum, artifact.content_checksum, artifact.compressed_size, store.storage_id
+            )
             store.verify(record, lambda: 2)
             self.assertEqual(
                 received, [(b"sdk-wire-data", base64.b64encode(hashlib.md5(b"sdk-wire-data").digest()).decode())]
@@ -396,7 +417,7 @@ class ArtifactFlowTest(TestCase):
             )
         self.assertEqual(finalize_export(self.job.pk, self.store).actual_total, 2)
 
-    def test_worker_upload_timeout_retains_part_and_artifact_ownership(self):
+    def test_worker_upload_timeout_retries_part(self):
         @contextmanager
         def query(job):
             yield Mock(request=Mock(return_value={}), read=Mock(return_value={"list": [], "done": True}))
@@ -417,11 +438,10 @@ class ArtifactFlowTest(TestCase):
                 store=self.store,
             )
         part.refresh_from_db()
-        self.assertEqual(part.status, "UPLOADING")
+        self.assertEqual(part.status, "WAITING")
         self.assertEqual(part.error_code, "UPLOAD_EXIT_UNCONFIRMED")
-        self.assertEqual(part.lease_id, "owner")
-        self.assertEqual(self.job.artifacts.get().status, "UPLOADING")
-        budget.release.assert_not_called()
+        self.assertEqual(part.lease_id, "")
+        budget.release.assert_called_once()
 
 
 @override_settings(
@@ -510,11 +530,10 @@ class BKRepoArtifactStoreTest(TestCase):
 
         self.client.put_effect = stored_then_timeout
         key = self.store.publish(part, artifact, lambda: 30)
-        self.assertEqual(key, self.job.artifacts.get().object_key)
-        self.assertEqual(self.job.artifacts.get().status, "READY")
+        self.assertTrue(key.startswith(artifact_prefix(self.job)))
         self.assertEqual(self.client.puts, 1)
 
-    def test_unconfirmed_put_retains_uploading_marker(self):
+    def test_unconfirmed_put_has_no_persistent_marker(self):
         part, _credentials = self.start_part()
         artifact = self.artifact()
 
@@ -525,12 +544,11 @@ class BKRepoArtifactStoreTest(TestCase):
         with self.assertRaisesMessage(UnconfirmedQueryExit, "UPLOAD_EXIT_UNCONFIRMED"):
             self.store.publish(part, artifact, lambda: 30)
         self.assertEqual(self.client.puts, 3)
-        self.assertEqual(self.job.artifacts.get().status, "UPLOADING")
 
     def test_existing_wrong_object_is_not_overwritten(self):
         part, _credentials = self.start_part()
         artifact = self.artifact()
-        key = f"{artifact_prefix(self.job)}{self.plan.plan_version}/{part.pk}/{artifact.checksum}.tar.gz"
+        key = f"{artifact_prefix(self.job)}{self.plan.plan_version}/{part.pk}/{part.dispatch_generation}/{artifact.checksum}.tar.gz"
         self.client.objects[self.store._key(key)] = b"wrong", "bad-checksum"
         with self.assertRaisesMessage(PartError, "ARTIFACT_VERIFICATION_FAILED"):
             self.store.publish(part, artifact, lambda: 30)

@@ -491,7 +491,18 @@ def retry_part(part_id, *, generation, lease_id, error_code, error_detail, next_
         )
 
 
-def complete_part(part_id, *, generation, lease_id, actual_rows, actual_bytes, compressed_bytes, object_key, checksum):
+def complete_part(
+    part_id,
+    *,
+    generation,
+    lease_id,
+    actual_rows,
+    actual_bytes,
+    compressed_bytes,
+    object_key,
+    checksum,
+    content_checksum="",
+):
     if (
         any(type(value) is not int or value < 0 for value in (actual_rows, actual_bytes, compressed_bytes))
         or not object_key
@@ -513,6 +524,7 @@ def complete_part(part_id, *, generation, lease_id, actual_rows, actual_bytes, c
             processed_rows=actual_rows,
             object_key=object_key,
             checksum=checksum,
+            content_checksum=content_checksum,
             lease_id="",
             lease_until=None,
             heartbeat_at=None,
@@ -582,7 +594,7 @@ def split_part(
         return list(ExportPart.objects.filter(plan=plan, parent=part).order_by("part_no"))
 
 
-def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_checksum):
+def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_checksum, manifest_bytes=None):
     if not manifest_object_key or not manifest_checksum:
         raise ExportStateError("manifest object and checksum are required")
     with transaction.atomic():
@@ -603,6 +615,7 @@ def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_
             actual_total=leaves.aggregate(value=Sum("actual_rows"))["value"] or 0,
             manifest_object_key=manifest_object_key,
             manifest_checksum=manifest_checksum,
+            manifest_bytes=manifest_bytes,
             error_code="",
             error_detail="",
             next_finalization_at=None,

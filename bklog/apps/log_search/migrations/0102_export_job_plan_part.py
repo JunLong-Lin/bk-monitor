@@ -12,28 +12,6 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.CreateModel(
-            name="ExportArtifact",
-            fields=[
-                ("id", models.BigAutoField(primary_key=True, serialize=False)),
-                ("created_at", models.DateTimeField(auto_now_add=True, verbose_name="创建时间")),
-                ("updated_at", models.DateTimeField(auto_now=True, verbose_name="更新时间")),
-                ("object_key", models.CharField(max_length=255, unique=True)),
-                ("storage_id", models.CharField(max_length=64)),
-                ("checksum", models.CharField(max_length=64)),
-                ("content_checksum", models.CharField(blank=True, default="", max_length=64)),
-                ("size", models.PositiveBigIntegerField()),
-                (
-                    "status",
-                    models.CharField(
-                        choices=[("UPLOADING", "上传中"), ("READY", "就绪")], default="UPLOADING", max_length=16
-                    ),
-                ),
-            ],
-            options={
-                "db_table": "log_export_artifact",
-            },
-        ),
-        migrations.CreateModel(
             name="ExportDispatchGate",
             fields=[
                 ("namespace", models.CharField(max_length=128, primary_key=True, serialize=False)),
@@ -131,6 +109,8 @@ class Migration(migrations.Migration):
                     "manifest_checksum",
                     models.CharField(blank=True, default="", max_length=64, verbose_name="清单SHA256"),
                 ),
+                ("manifest_bytes", models.PositiveBigIntegerField(blank=True, null=True, verbose_name="清单字节数")),
+                ("artifacts_cleaned_at", models.DateTimeField(blank=True, null=True, verbose_name="产物清理完成时间")),
                 ("finalization_attempts", models.PositiveIntegerField(default=0)),
                 ("next_finalization_at", models.DateTimeField(blank=True, null=True)),
                 ("started_at", models.DateTimeField(blank=True, null=True, verbose_name="开始时间")),
@@ -289,6 +269,10 @@ class Migration(migrations.Migration):
                     models.CharField(blank=True, default="", max_length=1024, verbose_name="获胜产物对象键"),
                 ),
                 ("checksum", models.CharField(blank=True, default="", max_length=64, verbose_name="获胜产物SHA256")),
+                (
+                    "content_checksum",
+                    models.CharField(blank=True, default="", max_length=64, verbose_name="日志内容SHA256"),
+                ),
                 ("published_at", models.DateTimeField(blank=True, null=True, verbose_name="消息发布时间")),
                 ("started_at", models.DateTimeField(blank=True, null=True, verbose_name="本次执行开始时间")),
                 ("finished_at", models.DateTimeField(blank=True, null=True, verbose_name="本次执行完成时间")),
@@ -332,13 +316,6 @@ class Migration(migrations.Migration):
             model_name="exportjob",
             index=models.Index(fields=["expires_at"], name="export_job_expiry"),
         ),
-        migrations.AddField(
-            model_name="exportartifact",
-            name="job",
-            field=models.ForeignKey(
-                on_delete=django.db.models.deletion.PROTECT, related_name="artifacts", to="log_search.exportjob"
-            ),
-        ),
         migrations.AddIndex(
             model_name="exportpart",
             index=models.Index(fields=["status", "next_retry_at"], name="export_part_waiting"),
@@ -350,9 +327,5 @@ class Migration(migrations.Migration):
         migrations.AddIndex(
             model_name="exportpart",
             index=models.Index(fields=["lease_until"], name="export_part_lease"),
-        ),
-        migrations.AddIndex(
-            model_name="exportartifact",
-            index=models.Index(fields=["job", "status"], name="export_artifact_cleanup"),
         ),
     ]

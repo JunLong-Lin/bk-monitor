@@ -93,7 +93,7 @@ from apps.log_search.exceptions import (
     SourceDuplicateException,
 )
 from apps.log_search.utils import fetch_request_username
-from apps.log_search.export.models import ExportArtifact, ExportDispatchGate, ExportJob, ExportPart, ExportPlan  # noqa: F401
+from apps.log_search.export.models import ExportDispatchGate, ExportJob, ExportPart, ExportPlan  # noqa: F401
 from apps.models import (
     JsonField,
     MultiStrSplitByCommaField,

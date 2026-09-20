@@ -157,7 +157,6 @@ class Coordinator:
         waiting = ExportPart.objects.filter(
             plan__job=job,
             plan__plan_version=job.current_plan_version,
-            plan__status=ExportPlan.Status.READY,
             status=ExportPart.Status.WAITING,
             is_leaf=True,
         ).filter(Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=timezone.now()))
@@ -185,7 +184,6 @@ class Coordinator:
         has_waiting = ExportPart.objects.filter(
             plan__job_id=OuterRef("pk"),
             plan__plan_version=OuterRef("current_plan_version"),
-            plan__status=ExportPlan.Status.READY,
             status=ExportPart.Status.WAITING,
             is_leaf=True,
         ).filter(Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=now))
@@ -251,19 +249,17 @@ class Coordinator:
         return [records[pk] for pk in identifiers if pk in records]
 
     def recover_expired(self, limit=100):
-        """只回收未被领取的过期投递；运行中的 I/O 保留其预留。"""
-        retained = []
+        """回收过期投递和执行，并据数据库状态重建额度。"""
+        recovered = []
         expired = ExportPart.objects.filter(status__in=INFLIGHT).filter(
             Q(lease_until__lte=timezone.now()) | Q(lease_until__isnull=True)
         )
         for candidate in self._batch(expired, "expired", limit):
-            if candidate.status != ExportPart.Status.DISPATCHED:
-                retained.append(candidate.pk)
-                continue
             with self.gate():
-                state.recover_expired_part(candidate)
+                if state.recover_expired_part(candidate):
+                    recovered.append(candidate.pk)
         self.reconcile()
-        return retained
+        return recovered
 
     def planning_jobs(self, limit=100):
         now = timezone.now()
@@ -279,7 +275,6 @@ class Coordinator:
         failed = ExportPart.objects.filter(
             status=ExportPart.Status.FAILED,
             is_leaf=True,
-            plan__status=ExportPlan.Status.READY,
             plan__job__status=ExportJob.Status.RUNNING,
             plan__plan_version=F("plan__job__current_plan_version"),
         )
@@ -291,7 +286,6 @@ class Coordinator:
             ExportPlan.objects.filter(
                 job_id=OuterRef("pk"),
                 plan_version=OuterRef("current_plan_version"),
-                status=ExportPlan.Status.READY,
                 part_count__gt=0,
             )
             .annotate(
@@ -318,7 +312,10 @@ class Coordinator:
         # 先结算已耗尽的失败，再为这些 Job 授权新工作。
         for part in self.failed_parts(limit):
             if part.error_code in SPLITTABLE_PART_ERROR_CODES:
-                yield "split", part.pk
+                if part.next_retry_at is None:
+                    yield "split", part.pk
+                else:
+                    state.fail_split(part.pk, error_code="SPLIT_TIMEOUT")
             else:
                 state.fail_exhausted_part(part.pk)
         for job in self.planning_jobs(limit):

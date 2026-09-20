@@ -123,7 +123,7 @@ class CoordinatorTest(TestCase):
         self.ready(oversized=True)
         self.assertEqual(len(self.coordinator.tick()), 1)
 
-    def test_redis_loss_rebuild_keeps_running_expired_and_canceled_job_io(self):
+    def test_redis_loss_rebuild_releases_expired_canceled_job_io(self):
         job, _ = self.ready()
         self.coordinator.tick()
         for part in ExportPart.objects.filter(status="DISPATCHED"):
@@ -131,21 +131,34 @@ class CoordinatorTest(TestCase):
         state.cancel_job(job.pk)
         ExportPart.objects.filter(status="RUNNING").update(lease_until=timezone.now() - timedelta(seconds=1))
         self.redis_client.delete(self.budget.key)
-        self.ready()
+        next_job, _ = self.ready()
         self.assertEqual(self.coordinator.tick(), [])
-        retained = self.coordinator.recover_expired()
-        self.assertEqual(len(retained), 4)
-        self.assertEqual(self.coordinator.tick(), [])
+        recovered = self.coordinator.recover_expired()
+        self.assertEqual(len(recovered), 4)
+        self.assertFalse(ExportPart.objects.filter(plan__job=job, status="RUNNING").exists())
+        self.assertEqual(len(self.coordinator.tick()), 4)
+        self.assertEqual(ExportPart.objects.filter(plan__job=next_job, status="DISPATCHED").count(), 4)
 
-    def test_expired_running_execution_keeps_its_reservation(self):
+    def test_expired_running_execution_returns_to_waiting(self):
         _, plan = self.ready()
         part = self.coordinator.reserve()
         state.claim_part(part.pk, lease_id=part.lease_id)
         ExportPart.objects.filter(pk=part.pk).update(lease_until=timezone.now() - timedelta(seconds=1))
         self.assertEqual(self.coordinator.recover_expired(), [part.pk])
         part.refresh_from_db()
-        self.assertEqual(part.status, "RUNNING")
+        self.assertEqual(part.status, "WAITING")
         self.assertEqual(part.attempts, 1)
+        self.assertEqual(part.lease_id, "")
+        self.assertFalse(self.redis_client.hexists(self.budget.key, str(part.pk)))
+
+    def test_recovery_rebuilds_stale_budget_without_expired_parts(self):
+        self.ready()
+        part = self.coordinator.reserve()
+        state.claim_part(part.pk, lease_id=part.lease_id)
+        state.retry_part(part.pk, lease_id=part.lease_id, error_code="QUERY_FAILED", error_detail="")
+        self.assertTrue(self.redis_client.hexists(self.budget.key, str(part.pk)))
+        self.assertEqual(self.coordinator.recover_expired(), [])
+        self.assertFalse(self.redis_client.hexists(self.budget.key, str(part.pk)))
 
     def test_expired_unclaimed_delivery_can_be_released_without_io_proof(self):
         self.ready()
@@ -276,7 +289,7 @@ class CoordinatorTest(TestCase):
         self.assertEqual(part.status, "DISPATCHED")
         self.assertEqual(part.lease_id, "changed")
 
-    def test_unconfirmed_execution_does_not_starve_later_expired_dispatch(self):
+    def test_expired_execution_does_not_starve_later_expired_dispatch(self):
         self.ready()
         first = self.coordinator.reserve()
         second = self.coordinator.reserve()
@@ -289,7 +302,7 @@ class CoordinatorTest(TestCase):
         second.refresh_from_db()
         self.assertEqual(second.status, "WAITING")
         first.refresh_from_db()
-        self.assertEqual(first.status, "RUNNING")
+        self.assertEqual(first.status, "WAITING")
 
     def test_planning_scans_rotate_even_when_messages_never_start(self):
         first = create_job()
@@ -324,6 +337,18 @@ class CoordinatorTest(TestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, "FAILED")
         self.assertEqual(self.coordinator.tick(), [])
+
+    def test_expired_split_attempt_fails_job(self):
+        job, plan = self.ready()
+        ExportJob.objects.filter(pk=job.pk).update(status="RUNNING")
+        part = plan.parts.get(part_no=1)
+        ExportPart.objects.filter(pk=part.pk).update(
+            status="FAILED", error_code="OVERSIZED", next_retry_at=timezone.now() - timedelta(seconds=1)
+        )
+        self.assertEqual(list(self.coordinator.control_work(limit=1)), [])
+        job.refresh_from_db()
+        self.assertEqual(job.status, "FAILED")
+        self.assertEqual(job.error_code, "SPLIT_TIMEOUT")
 
 
 @override_settings(ASYNC_EXPORT_SHARDED_ENABLED=True)

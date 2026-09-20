@@ -101,14 +101,8 @@ class ExportJob(PlanningRecord):
 class ExportPlan(ExportRecord):
     """一份完整且带版本的计划；一个 Job 同时只有一个生效版本。"""
 
-    class Status(models.TextChoices):
-        PLANNING = "PLANNING", _("规划中")
-        READY = "READY", _("已完整持久化")
-        FAILED = "FAILED", _("规划失败")
-
     job = models.ForeignKey(ExportJob, on_delete=models.PROTECT, related_name="plans")
     plan_version = models.PositiveIntegerField(_("计划版本"), validators=[MinValueValidator(1)])
-    status = models.CharField(_("状态"), max_length=16, choices=Status.choices, default=Status.PLANNING)
     planning_input = models.JSONField(_("规划输入快照"), default=dict, blank=True)
     query_hash = models.CharField(_("查询摘要"), max_length=64)
     statistics_at = models.DateTimeField(_("统计时间"), null=True, blank=True)
@@ -116,8 +110,6 @@ class ExportPlan(ExportRecord):
     target_bytes = models.PositiveBigIntegerField(_("单片目标字节数"), validators=[MinValueValidator(1)])
     histogram_interval = models.PositiveBigIntegerField(_("初始桶宽，单位同Job时间"), validators=[MinValueValidator(1)])
     part_count = models.PositiveIntegerField(_("有效叶子数量"), default=0)
-    error_code = models.CharField(_("错误分类"), max_length=64, blank=True, default="")
-    error_detail = models.TextField(_("脱敏错误详情"), blank=True, default="")
 
     class Meta:
         db_table = "log_export_plan"

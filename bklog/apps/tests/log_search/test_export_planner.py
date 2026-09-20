@@ -189,7 +189,7 @@ class PlanningStateTest(TestCase):
         self.assertEqual(job.error_code, "PLANNING_TIMEOUT")
 
     @override_settings(ASYNC_EXPORT_MAX_ATTEMPTS=1)
-    def test_split_statistics_failure_backs_off_without_failing_job(self):
+    def test_split_statistics_failure_fails_job(self):
         job = create_job()
         plan = plan_job(job.pk, lambda job: Distribution({}))
         part = plan.parts.get()
@@ -201,10 +201,9 @@ class PlanningStateTest(TestCase):
         replan_failed_part(part.pk, Mock(side_effect=TimeoutError))
         job.refresh_from_db()
         part.refresh_from_db()
-        self.assertEqual(job.status, "RUNNING")
+        self.assertEqual(job.status, "FAILED")
+        self.assertEqual(job.error_code, "STATISTICS_FAILED")
         self.assertEqual(part.status, "FAILED")
-        self.assertIsNotNone(part.next_retry_at)
-        self.assertEqual(part.error_code, "STATISTICS_FAILED")
         self.assertEqual(part.attempts, 1)
 
     def test_query_factory_always_restores_context(self):
@@ -297,9 +296,12 @@ class PlanningStateTest(TestCase):
         self.assertIsNotNone(state.begin_split(part.pk))
         # 进行中的拆分不会被重复认领。
         self.assertIsNone(state.begin_split(part.pk))
-        # 退避到期后可重新认领。
+        # 拆分超时后不能重复规划，应让 Job 明确失败。
         ExportPart.objects.filter(pk=part.pk).update(next_retry_at=timezone.now() - timedelta(seconds=1))
-        self.assertIsNotNone(state.begin_split(part.pk))
+        self.assertIsNone(state.begin_split(part.pk))
+        state.fail_split(part.pk, error_code="SPLIT_TIMEOUT")
+        job.refresh_from_db()
+        self.assertEqual(job.status, "FAILED")
 
 
 @override_settings(ASYNC_EXPORT_VERIFIED_QUERY_KINDS=["union"], ASYNC_EXPORT_QUERY_END_MODES={"union": "inclusive"})

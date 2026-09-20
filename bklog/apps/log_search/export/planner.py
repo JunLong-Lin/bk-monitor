@@ -208,11 +208,7 @@ def _run_split(part: ExportPart | None, statistics_factory: StatisticsFactory):
         return None
     except Exception as exc:
         error = _classify_planning_error(part.plan.job, exc)
-        if error.code == "OVERSIZED_UNSPLITTABLE":
-            # 已到时间字段最小精度仍超量，无法继续按时间拆分，Job 明确失败。
-            state.fail_job(part.plan.job.pk, error_code=error.code)
-        else:
-            state.fail_split(part.pk, error_code=error.code, error_detail=type(exc).__name__)
+        state.fail_split(part.pk, error_code=error.code, error_detail=type(exc).__name__)
         return None
 
 

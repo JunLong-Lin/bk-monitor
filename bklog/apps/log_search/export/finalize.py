@@ -18,7 +18,7 @@ from apps.log_search.export.files import export_temporary_directory
 
 
 def manifest_snapshot(job, store_id):
-    plan = ExportPlan.objects.get(job=job, plan_version=job.current_plan_version, status=ExportPlan.Status.READY)
+    plan = ExportPlan.objects.get(job=job, plan_version=job.current_plan_version)
     parts = list(plan.parts.filter(is_leaf=True).order_by("start_time", "part_no"))
     if not parts or len(parts) != plan.part_count or any(p.status != ExportPart.Status.SUCCESS for p in parts):
         raise PartError("MANIFEST_PARTS_INCOMPLETE")
@@ -99,7 +99,7 @@ def finalize_export(job_id, store):
             store.verify(record, guard)
         content = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         checksum = hashlib.sha256(content).hexdigest()
-        key = f"{artifact_prefix(job)}{job.current_plan_version}/manifest/{attempt}/{checksum}.json"
+        key = f"{artifact_prefix(job)}{job.current_plan_version}/manifest/{checksum}.json"
         with export_temporary_directory("manifest") as directory:
             path = Path(directory) / "manifest.json"
             path.write_bytes(content)

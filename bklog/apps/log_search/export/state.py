@@ -59,7 +59,7 @@ def _get_locked_part(part_id):
 
 
 def _ensure_current_part(part, plan, job):
-    if not part.is_leaf or plan.status != ExportPlan.Status.READY or job.current_plan_version != plan.plan_version:
+    if not part.is_leaf or job.current_plan_version != plan.plan_version:
         raise StaleExportUpdateError(f"Part {part.pk} is not a current active leaf")
 
 
@@ -246,7 +246,6 @@ def persist_plan(
         plan = ExportPlan.objects.create(
             job=job,
             plan_version=plan_version,
-            status=ExportPlan.Status.READY,
             planning_input=dict(planning_input or {}),
             query_hash=query_hash,
             statistics_at=statistics_at,
@@ -380,12 +379,12 @@ def begin_part_upload(part_id, *, lease_id):
 
 
 def retry_part(part_id, *, lease_id, error_code, error_detail, next_retry_at=None):
-    """记录已安全结束的 I/O；仅凭 TTL 到期不能作为退出的证据。"""
+    """记录当前尝试失败，并将仍可重试的 Part 交回调度器。"""
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_worker_credential(part, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
-        if job.status in {ExportJob.Status.CANCELED, ExportJob.Status.FAILED}:
+        if job.status in {ExportJob.Status.CANCELED, ExportJob.Status.FAILED, ExportJob.Status.SUCCESS}:
             target = ExportPart.Status.CANCELED
         else:
             _ensure_running_job(job)
@@ -503,7 +502,7 @@ def split_part(part_id: int, *, children: Iterable[PartSpec], max_leaf_parts=Non
 
 
 def begin_split(part_id):
-    """认领一个待拆分的 OVERSIZED 叶子；next_retry_at 兼作进行中与退避标记。"""
+    """认领一个待拆分的 OVERSIZED 叶子；超时后明确失败。"""
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
@@ -511,25 +510,20 @@ def begin_split(part_id):
         if part.status != ExportPart.Status.FAILED or part.error_code not in SPLITTABLE_PART_ERROR_CODES:
             return None
         now = _now()
-        if part.next_retry_at and part.next_retry_at > now:
+        if part.next_retry_at is not None:
             return None
         _save(part, next_retry_at=now + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_DEADLINE))
         return part
 
 
 def fail_split(part_id, *, error_code, error_detail=""):
-    """拆分未完成，退避后等待下一轮扫描重试。"""
+    """拆分不能完成时让 Job 明确失败，避免无限重试。"""
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
-        if part.status != ExportPart.Status.FAILED:
+        if part.status != ExportPart.Status.FAILED or job.status != ExportJob.Status.RUNNING:
             return
-        _save(
-            part,
-            next_retry_at=_now() + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_RETRY_SECONDS),
-            error_code=error_code,
-            error_detail=error_detail,
-        )
+        _finish_job(job, ExportJob.Status.FAILED, error_code=error_code, error_detail=error_detail)
 
 
 def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_checksum, manifest_bytes=None):
@@ -540,7 +534,7 @@ def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_
         _ensure_job_transition(job, ExportJob.Status.SUCCESS)
         if job.current_plan_version != plan_version:
             raise StaleExportUpdateError("plan version is no longer current")
-        plan = ExportPlan.objects.get(job=job, plan_version=plan_version, status=ExportPlan.Status.READY)
+        plan = ExportPlan.objects.get(job=job, plan_version=plan_version)
         leaves = plan.parts.filter(is_leaf=True)
         if not plan.part_count or leaves.count() != plan.part_count:
             raise PlanValidationError("active leaf count does not match the persisted plan")
@@ -603,15 +597,33 @@ def cancel_job(job_id):
 
 
 def recover_expired_part(candidate):
-    """回收未被任何 Worker 领取的过期投递。"""
+    """过期尝试交回调度器；旧 Worker 的租约不能再提交结果。"""
     with transaction.atomic():
-        part, _, _ = _get_locked_part(candidate.pk)
+        part, _, job = _get_locked_part(candidate.pk)
         fields = ("status", "lease_id", "lease_until")
         if any(getattr(part, field) != getattr(candidate, field) for field in fields):
             return False
-        if part.status != ExportPart.Status.DISPATCHED:
+        if part.status not in {ExportPart.Status.DISPATCHED, ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING}:
             return False
-        release_dispatch(part.pk, lease_id=part.lease_id, error_code="DISPATCH_LEASE_EXPIRED")
+        if part.lease_until is not None and part.lease_until > _now():
+            return False
+        if job.status in {ExportJob.Status.CANCELED, ExportJob.Status.FAILED}:
+            target = ExportPart.Status.CANCELED
+        elif part.attempts >= settings.ASYNC_EXPORT_MAX_ATTEMPTS:
+            target = ExportPart.Status.FAILED
+        else:
+            target = ExportPart.Status.WAITING
+        _save(
+            part,
+            status=target,
+            stage="",
+            lease_id="",
+            lease_until=None,
+            heartbeat_at=None,
+            next_retry_at=None,
+            finished_at=_now(),
+            error_code="PART_LEASE_EXPIRED",
+        )
         return True
 
 

@@ -89,22 +89,26 @@ class AttemptGuard:
     def __init__(self, part, budget, policy, credentials):
         self.part, self.budget, self.credentials = part, budget, credentials
         self.deadline = time.monotonic() + policy.deadline
+        self.next_heartbeat_at = 0
 
     def __call__(self):
-        remaining = self.deadline - time.monotonic()
+        now = time.monotonic()
+        remaining = self.deadline - now
         if remaining <= 0:
             raise PartError("PART_DEADLINE_EXCEEDED")
         lease_seconds = settings.ASYNC_EXPORT_LEASE_SECONDS
         if lease_seconds <= 1:
             raise BudgetUnavailable("bounded worker I/O requires a configured lease")
-        if ExportJob.objects.get(pk=self.part.plan.job_id).status != ExportJob.Status.RUNNING:
-            raise PartError("JOB_STOPPED")
-        renew_worker_lease(
-            self.budget,
-            self.part.pk,
-            **self.credentials,
-            lease_until=timezone.now() + timedelta(seconds=lease_seconds),
-        )
+        if now >= self.next_heartbeat_at:
+            if ExportJob.objects.get(pk=self.part.plan.job_id).status != ExportJob.Status.RUNNING:
+                raise PartError("JOB_STOPPED")
+            renew_worker_lease(
+                self.budget,
+                self.part.pk,
+                **self.credentials,
+                lease_until=timezone.now() + timedelta(seconds=lease_seconds),
+            )
+            self.next_heartbeat_at = time.monotonic() + lease_seconds / 3
         # 留出余量，确保租约到期前还能观察到响应。
         return min(remaining, lease_seconds / 2)
 

@@ -103,9 +103,7 @@ def coordinate_sharded_exports():
             RedisBudget(get_redis_connection("default"), settings.ASYNC_EXPORT_NAMESPACE), publish_part
         )
         limit = settings.ASYNC_EXPORT_SCAN_LIMIT
-        retained = coordinator.recover_expired(limit=limit)
-        if retained:
-            logger.warning("sharded export recovery retained %s unconfirmed executions", len(retained))
+        coordinator.recover_expired(limit=limit)
         for kind, identifier in coordinator.control_work(limit, finalize=bool(settings.ASYNC_EXPORT_FINALIZE_TASK)):
             if kind == "finalize":
                 app.send_task(

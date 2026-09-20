@@ -47,9 +47,8 @@ def create_export(request, data):
         raise ValidationError("QUERY_MODE_NOT_IMPLEMENTED")
     identity = dict(space_uid=space.space_uid, created_by=username)
     source_app = get_request_app_code()
-    with admission.admission_lock(username):
-        AsyncTask.check_running_count_by_user(username)
-
+    # 元数据构造可能访问远端；先廉价拒绝，最终准入仍在 create_job 的事务内复检。
+    AsyncTask.check_running_count_by_user(username)
     params = {
         key: deepcopy(data[key])
         for key in ("start_time", "end_time", "keyword", "addition", "ip_chooser", "sort_list", "export_fields")

@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from unittest import SkipTest
@@ -112,6 +113,12 @@ class CoordinatorTest(TestCase):
         self.ready(resources=["index:2"])
         self.assertEqual(len(self.coordinator.tick()), 8)
 
+    def test_tick_rebuilds_ledger_once_for_multiple_reservations(self):
+        self.ready()
+        with patch.object(self.budget, "rebuild", wraps=self.budget.rebuild) as rebuild:
+            self.assertEqual(len(self.coordinator.tick(max_dispatches=4)), 4)
+        rebuild.assert_called_once()
+
     def test_oversized_budget_does_not_bypass_global_budget(self):
         self.ready(oversized=True)
         self.assertEqual(len(self.coordinator.tick()), 1)
@@ -173,6 +180,24 @@ class CoordinatorTest(TestCase):
         self.assertEqual(part.status, "WAITING")
         self.assertEqual(part.attempts, 0)
         self.assertFalse(self.redis_client.hexists(self.budget.key, str(part.pk)))
+
+    def test_publish_failure_does_not_release_budget_before_db_commit(self):
+        self.ready()
+        part = self.coordinator.reserve()
+        self.publish.side_effect = PublishNotSent()
+        original_gate = self.coordinator.gate
+
+        @contextmanager
+        def failed_commit():
+            with original_gate() as gate:
+                yield gate
+                raise RuntimeError("database commit failed")
+
+        with patch.object(self.coordinator, "gate", failed_commit), self.assertRaises(RuntimeError):
+            self.coordinator.deliver(part)
+        part.refresh_from_db()
+        self.assertEqual(part.status, ExportPart.Status.DISPATCHED)
+        self.assertTrue(self.redis_client.hexists(self.budget.key, str(part.pk)))
 
     def test_crash_after_db_commit_is_discovered_by_replay(self):
         self.ready()

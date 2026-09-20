@@ -89,6 +89,13 @@ class RedisBudget:
         self.execute("rebuild", epoch, json.dumps(entries))
         return epoch
 
+    def current_epoch(self):
+        try:
+            epoch = self.client.hget(self.key, "_epoch")
+        except Exception as exc:
+            raise BudgetUnavailable("Redis export budget is unavailable") from exc
+        return epoch.decode() if isinstance(epoch, bytes) else epoch
+
     def acquire(self, part, epoch, limits):
         entry = credential(part)
         capacities = {key: limits.index_limit for key in entry["dimensions"]}
@@ -136,9 +143,10 @@ class Coordinator:
         if self.limits.global_limit <= 0 or self.limits.lease_seconds <= 0:
             return None
         with self.gate() as gate:
-            # 以数据库为准：提交前崩溃只会留下 Redis 孤儿预留，且没有发出
-            # 任何消息，重建时会被丢弃。
-            epoch = self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
+            # 同一轮协调复用账本；Redis 丢失时在数据库锁内恢复。
+            epoch = self.budget.current_epoch()
+            if epoch is None:
+                epoch = self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
             jobs = ExportJob.objects.filter(status__in=[ExportJob.Status.READY, ExportJob.Status.RUNNING])
             limit = settings.ASYNC_EXPORT_SCAN_LIMIT
             # aging：长时间没有获得投递的 Job 插队优先，再回到持久化 RR 轮转。
@@ -210,13 +218,14 @@ class Coordinator:
         try:
             self.publish(current)
         except PublishNotSent:
-            # 与 Worker 的快速领取和账本重建互斥。
+            # 在数据库锁内确认 Worker 尚未领取，再撤销投递。
             with self.gate():
                 try:
                     state.release_dispatch(part.pk, generation=part.dispatch_generation, lease_id=part.lease_id)
                 except state.ExportStateError:
                     return "claimed"
-                self.budget.release(part.pk, part.dispatch_generation, part.lease_id)
+            # 数据库提交成功后才能释放额度；否则事务回滚会造成 Redis 少计。
+            self.budget.release(part.pk, part.dispatch_generation, part.lease_id)
             return "not_sent"
         except Exception:
             # broker 超时/断连不能证明消息未投递。
@@ -227,7 +236,9 @@ class Coordinator:
             pass  # Worker 可能已经失败或重试了这一代。
         return "published"
 
-    def tick(self, max_dispatches=100):
+    def tick(self, max_dispatches=100, *, reconcile=True):
+        if reconcile:
+            self.reconcile()
         sent = []
         for _ in range(max_dispatches):
             part = self.reserve()
@@ -261,8 +272,9 @@ class Coordinator:
             records = {record.pk: record for record in queryset.filter(pk__in=identifiers)}
         return [records[pk] for pk in identifiers if pk in records]
 
-    def replay(self, limit=100):
-        self.reconcile()
+    def replay(self, limit=100, *, reconcile=True):
+        if reconcile:
+            self.reconcile()
         parts = self._batch(
             ExportPart.objects.filter(status=ExportPart.Status.DISPATCHED, lease_until__gt=timezone.now()),
             "replay",

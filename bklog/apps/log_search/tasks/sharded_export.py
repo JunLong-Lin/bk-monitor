@@ -118,8 +118,8 @@ def coordinate_sharded_exports():
             else:
                 task = plan_sharded_export if kind == "plan" else split_sharded_export
                 task.apply_async(args=[identifier], queue=settings.ASYNC_EXPORT_CONTROL_QUEUE, retry=False)
-        coordinator.replay(limit=limit)
-        coordinator.tick(max_dispatches=limit)
+        coordinator.replay(limit=limit, reconcile=False)
+        coordinator.tick(max_dispatches=limit, reconcile=False)
         if settings.ASYNC_EXPORT_FINALIZE_TASK:
             for job_id in coordinator.cleanup_jobs(limit):
                 cleanup_sharded_export.apply_async(

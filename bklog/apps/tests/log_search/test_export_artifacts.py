@@ -25,7 +25,7 @@ from apps.log_search.export.storage import (
     artifact_prefix,
     bkrepo_artifact_store,
 )
-from apps.log_search.export.worker import Artifact, PartError, UnconfirmedQueryExit, run_part
+from apps.log_search.export.worker import Artifact, PartError, run_part
 from apps.tests.log_search.export_fixtures import create_job
 
 
@@ -234,7 +234,7 @@ class ArtifactFlowTest(TestCase):
         self.complete_parts()
         artifact = self.artifact(b"uncertain")
         with patch.object(self.client, "put_object", side_effect=TimeoutError()):
-            with self.assertRaises(UnconfirmedQueryExit):
+            with self.assertRaisesMessage(PartError, "COS_UPLOAD_FAILED"):
                 self.store.publish_file(self.job, artifact_prefix(self.job) + "uncertain", artifact, lambda: 30)
         state.cancel_job(self.job.pk)
         self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
@@ -436,7 +436,7 @@ class ArtifactFlowTest(TestCase):
             )
         part.refresh_from_db()
         self.assertEqual(part.status, "WAITING")
-        self.assertEqual(part.error_code, "UPLOAD_EXIT_UNCONFIRMED")
+        self.assertEqual(part.error_code, "COS_UPLOAD_FAILED")
         self.assertEqual(part.lease_id, "")
         budget.release.assert_called_once()
 
@@ -517,20 +517,25 @@ class BKRepoArtifactStoreTest(TestCase):
         self.assertEqual(cleanup_export(self.job.pk, self.store), 2)
         self.assertEqual(self.client.objects, {})
 
-    def test_lost_put_response_is_reconciled_by_head(self):
+    def test_lost_put_response_retries_and_reuses_existing_object(self):
         part, _credentials = self.start_part()
         artifact = self.artifact()
+        calls = 0
 
         def stored_then_timeout(key, stream, size, checksum, timeout):
-            self.client.objects[key] = stream.read(), checksum
-            raise requests.Timeout()
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                self.client.objects[key] = stream.read(), checksum
+                raise requests.Timeout()
+            return self.client.response(409, {"code": 250107, "message": "exists"})
 
         self.client.put_effect = stored_then_timeout
         key = self.store.publish(part, artifact, lambda: 30)
         self.assertTrue(key.startswith(artifact_prefix(self.job)))
-        self.assertEqual(self.client.puts, 1)
+        self.assertEqual(self.client.puts, 2)
 
-    def test_unconfirmed_put_has_no_persistent_marker(self):
+    def test_put_timeout_exhausts_attempts(self):
         part, _credentials = self.start_part()
         artifact = self.artifact()
 
@@ -538,7 +543,7 @@ class BKRepoArtifactStoreTest(TestCase):
             raise requests.Timeout()
 
         self.client.put_effect = timeout
-        with self.assertRaisesMessage(UnconfirmedQueryExit, "UPLOAD_EXIT_UNCONFIRMED"):
+        with self.assertRaisesMessage(PartError, "BKREPO_UPLOAD_FAILED"):
             self.store.publish(part, artifact, lambda: 30)
         self.assertEqual(self.client.puts, 3)
 

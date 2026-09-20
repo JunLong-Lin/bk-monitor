@@ -451,15 +451,6 @@ def begin_part_upload(part_id, *, generation, lease_id):
         return _save(part, status=ExportPart.Status.UPLOADING, stage=ExportJob.Stage.UPLOAD, heartbeat_at=_now())
 
 
-def note_unconfirmed_part(part_id, *, generation, lease_id, error_code):
-    """记录结果不确定的远端 I/O，不释放所有权与容量。"""
-    with transaction.atomic():
-        part, plan, job = _get_locked_part(part_id)
-        _ensure_current_part(part, plan, job)
-        _ensure_worker_credential(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
-        return _save(part, error_code=error_code, error_detail="Remote I/O exit requires verification")
-
-
 def retry_part(part_id, *, generation, lease_id, error_code, error_detail, next_retry_at=None):
     """记录已安全结束的 I/O；仅凭 TTL 到期不能作为退出的证据。"""
     with transaction.atomic():

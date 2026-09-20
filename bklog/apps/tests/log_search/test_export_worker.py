@@ -16,7 +16,6 @@ from apps.log_search.export.worker import (
     LocalArtifactStore,
     PartError,
     RawWithScrollReader,
-    UnconfirmedQueryExit,
     WorkerPolicy,
     run_part,
 )
@@ -82,7 +81,7 @@ class ReaderTest(SimpleTestCase):
 
     def test_network_error_does_not_retry_a_page(self):
         reader, query = self.reader([TimeoutError(), {"list": [], "done": True}])
-        with self.assertRaises(UnconfirmedQueryExit):
+        with self.assertRaisesMessage(PartError, "QUERY_FAILED"):
             list(reader)
         self.assertEqual(query.read.call_count, 1)
 
@@ -175,13 +174,13 @@ class PartWorkerTest(TestCase):
         self.assertEqual(observed, [("PACKAGE", 1)])
         self.assertEqual(self.part.status, ExportPart.Status.SUCCESS)
 
-    def test_query_timeout_retains_lease_and_does_not_publish(self):
+    def test_query_timeout_retries_part_without_publishing(self):
         query = query_with_pages([TimeoutError()])
         self.execute(query)
-        self.assertEqual(self.part.status, ExportPart.Status.RUNNING)
-        self.assertEqual(self.part.error_code, "QUERY_EXIT_UNCONFIRMED")
-        self.assertEqual(self.part.lease_id, "owner")
-        self.budget.release.assert_not_called()
+        self.assertEqual(self.part.status, ExportPart.Status.WAITING)
+        self.assertEqual(self.part.error_code, "QUERY_FAILED")
+        self.assertEqual(self.part.lease_id, "")
+        self.budget.release.assert_called_once()
         self.assertEqual(list(Path(self.temp.name).rglob("*.tar.gz")), [])
         query.close.assert_called_once()
 

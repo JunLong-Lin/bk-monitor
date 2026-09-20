@@ -12,8 +12,9 @@ from qcloud_cos import CosConfig, CosS3Client
 from qcloud_cos.cos_exception import CosServiceError
 from requests.auth import HTTPBasicAuth
 
+from apps.log_search.export.coordinator import BudgetUnavailable
 from apps.log_search.export.models import ExportJob
-from apps.log_search.export.worker import CheckedFile, PartError, UnconfirmedQueryExit
+from apps.log_search.export.worker import CheckedFile, PartError
 
 
 def artifact_prefix(job):
@@ -128,8 +129,11 @@ class CosArtifactStore(ArtifactStore):
                 except CosServiceError as error:
                     if error.get_status_code() < 500 or attempt + 1 == settings.ASYNC_EXPORT_COS_PUT_ATTEMPTS:
                         raise PartError("COS_UPLOAD_FAILED") from error
+                except (PartError, BudgetUnavailable):
+                    # 守卫或租约异常直接上抛，不能当作上传失败重试。
+                    raise
                 except Exception as error:
-                    raise UnconfirmedQueryExit("UPLOAD_EXIT_UNCONFIRMED") from error
+                    raise PartError("COS_UPLOAD_FAILED") from error
 
     def delete(self, record, guard):
         if record.storage_id != self.storage_id:
@@ -226,7 +230,7 @@ class BKRepoArtifactStore(ArtifactStore):
         try:
             return response.json()
         except ValueError as error:
-            raise UnconfirmedQueryExit("BKREPO_RESPONSE_UNCONFIRMED") from error
+            raise PartError("BKREPO_RESPONSE_INVALID") from error
 
     @staticmethod
     def _headers(response):
@@ -254,17 +258,6 @@ class BKRepoArtifactStore(ArtifactStore):
         if not self._matches(response, record):
             raise PartError("ARTIFACT_VERIFICATION_FAILED")
 
-    def _reconcile_upload(self, record, guard):
-        try:
-            response = self.head(record.object_key, guard)
-        except Exception as error:
-            raise UnconfirmedQueryExit("UPLOAD_EXIT_UNCONFIRMED") from error
-        if response is None:
-            return False
-        if self._matches(response, record):
-            return True
-        raise UnconfirmedQueryExit("UPLOAD_EXIT_UNCONFIRMED")
-
     def upload(self, record, artifact, guard, md5_digest):
         del md5_digest
         for attempt in range(settings.ASYNC_EXPORT_BKREPO_PUT_ATTEMPTS):
@@ -277,21 +270,18 @@ class BKRepoArtifactStore(ArtifactStore):
                         record.checksum,
                         min(guard(), settings.ASYNC_EXPORT_BKREPO_TIMEOUT),
                     )
-            # requests 一旦开始消费数据流，即使是租约校验或本地读取错误，
-            # 也无法证明 BKRepo 是否已落盘。
+            except (PartError, BudgetUnavailable):
+                # 守卫或租约异常直接上抛，不能当作上传失败重试。
+                raise
             except Exception as error:
-                if self._reconcile_upload(record, guard):
-                    return
                 if attempt + 1 == settings.ASYNC_EXPORT_BKREPO_PUT_ATTEMPTS:
-                    raise UnconfirmedQueryExit("UPLOAD_EXIT_UNCONFIRMED") from error
+                    raise PartError("BKREPO_UPLOAD_FAILED") from error
                 continue
             data = self._data(response)
             code = str(data.get("code"))
             if code == "0" or code in self.OBJECT_EXISTS_CODES:
                 return
             if response.status_code >= 500 and attempt + 1 < settings.ASYNC_EXPORT_BKREPO_PUT_ATTEMPTS:
-                if self._reconcile_upload(record, guard):
-                    return
                 continue
             raise PartError("BKREPO_UPLOAD_FAILED")
 

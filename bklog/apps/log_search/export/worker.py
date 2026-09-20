@@ -29,10 +29,6 @@ class PartError(Exception):
         super().__init__(code)
 
 
-class UnconfirmedQueryExit(PartError):
-    """HTTP 调用失败不能证明远端查询已经停止。"""
-
-
 @dataclass(frozen=True)
 class WorkerPolicy:
     batch_rows: int = 1000
@@ -65,7 +61,7 @@ class RawWithScrollReader:
             try:
                 response = self.query.read(params, timeout=timeout)
             except Exception as error:
-                raise UnconfirmedQueryExit("QUERY_EXIT_UNCONFIRMED") from error
+                raise PartError("QUERY_FAILED") from error
             self.guard()
             if (
                 not isinstance(response, dict)
@@ -261,19 +257,6 @@ def run_part(part_id, *, generation, lease_id, query_factory, budget, store, pol
                 object_key=key,
                 checksum=artifact.checksum,
             )
-    except UnconfirmedQueryExit as error:
-        if error.code in {"UPLOAD_EXIT_UNCONFIRMED", "BKREPO_RESPONSE_UNCONFIRMED"}:
-            # 上传代次使用独立对象键；迟到的旧上传不会覆盖下一次产物。
-            state.retry_part(
-                part.pk,
-                **credentials,
-                error_code=error.code,
-                error_detail=type(error).__name__,
-                next_retry_at=timezone.now() + timedelta(seconds=settings.ASYNC_EXPORT_PART_RETRY_SECONDS),
-            )
-        else:
-            state.note_unconfirmed_part(part.pk, **credentials, error_code=error.code)
-            return
     except Exception as error:
         code = error.code if isinstance(error, PartError | PlanningError) else "PART_EXECUTION_FAILED"
         try:

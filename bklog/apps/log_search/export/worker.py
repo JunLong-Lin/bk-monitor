@@ -152,10 +152,7 @@ class Artifact:
 
 
 def package_part(query, part, directory, policy, guard, *, on_packaging=None):
-    extension = part.plan.job.query_snapshot.get("export_file_type", "txt")
-    if extension not in {"txt", "log"}:
-        raise PartError("UNSUPPORTED_EXPORT_FILE_TYPE")
-    member_name = f"logs.{extension}"
+    member_name = "logs.log"
     payload = directory / "logs.jsonl"
     size = rows = 0
     reader = RawWithScrollReader(query, part, policy, guard)

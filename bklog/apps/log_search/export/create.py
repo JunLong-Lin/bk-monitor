@@ -96,7 +96,6 @@ def create_export(request, data):
         "search_params": params,
         "unify_query": base,
         "time_units_per_second": 1000,
-        "export_file_type": data["file_type"],
         "projection": projection,
         "request_hash": request_hash,
     }

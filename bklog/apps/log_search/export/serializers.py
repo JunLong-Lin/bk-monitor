@@ -1,5 +1,3 @@
-"""新协议的显式入参；内部快照永远不作为客户端输入。"""
-
 from rest_framework import serializers
 
 
@@ -20,16 +18,13 @@ class ExportCreateSerializer(serializers.Serializer):
     space_uid = serializers.CharField(max_length=256)
     index_set_id = serializers.IntegerField(min_value=1)
     request_id = serializers.CharField(max_length=128, required=False, default=None)
-    # 与旧接口不同，这里只接受明确的 epoch 毫秒和左闭右开区间；
-    # 相对时间与隐式单位推断一律拒绝。
-    start_time = serializers.IntegerField(min_value=0, max_value=253402300799000)
-    end_time = serializers.IntegerField(min_value=1, max_value=253402300799000)
+    start_time = serializers.IntegerField(min_value=0)
+    end_time = serializers.IntegerField(min_value=1)
     keyword = serializers.CharField(default="*", allow_blank=True)
     addition = ExportAdditionSerializer(many=True, default=list)
     ip_chooser = serializers.DictField(default=dict)
     sort_list = serializers.ListField(child=serializers.ListField(child=serializers.CharField()), default=list)
     export_fields = serializers.ListField(child=serializers.CharField(), default=list)
-    file_type = serializers.ChoiceField(choices=["log", "txt"], default="log")
     requested_parallelism = serializers.IntegerField(min_value=1, max_value=8, default=4)
 
     def validate_sort_list(self, value):

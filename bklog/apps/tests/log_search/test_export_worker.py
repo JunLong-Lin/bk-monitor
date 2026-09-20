@@ -148,7 +148,7 @@ class PartWorkerTest(TestCase):
         self.assertEqual(self.part.status, ExportPart.Status.SUCCESS)
         self.assertEqual(self.part.actual_rows, 2)
         with tarfile.open(Path(self.temp.name) / self.part.object_key.removeprefix("local:")) as bundle:
-            rows = [json.loads(line) for line in bundle.extractfile("logs.txt")]
+            rows = [json.loads(line) for line in bundle.extractfile("logs.log")]
         self.assertEqual(rows, [{"log": "one"}, {"log": "末行"}])
         query.close.assert_called_once()
         self.budget.release.assert_called_once()

@@ -1,4 +1,5 @@
 import json
+import os
 import tarfile
 import tempfile
 from contextlib import contextmanager
@@ -13,13 +14,40 @@ from django.utils import timezone
 from apps.log_search.export import state
 from apps.log_search.export.models import ExportPart
 from apps.log_search.export.worker import (
-    LocalArtifactStore,
+    CheckedFile,
     PartError,
     RawWithScrollReader,
     WorkerPolicy,
+    digest_file,
     run_part,
 )
 from apps.tests.log_search.export_fixtures import create_job
+
+
+class LocalArtifactStore:
+    """仅用于测试的本地产物落盘，不能替代 COS 或共享存储。"""
+
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+
+    def publish(self, part, artifact, guard):
+        key = f"{part.plan.job_id}/{part.plan.plan_version}/{part.pk}/{artifact.checksum}.tar.gz"
+        target = self.root / key
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # 先完整复制并校验，再原子链接；绝不覆盖已有的获胜对象。
+        with tempfile.NamedTemporaryFile(dir=target.parent) as temporary, artifact.path.open("rb") as source:
+            while block := CheckedFile(source, guard).read(1024 * 1024):
+                temporary.write(block)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            guard()
+            try:
+                os.link(temporary.name, target)
+            except FileExistsError:
+                pass
+        if target.stat().st_size != artifact.compressed_size or digest_file(target, guard) != artifact.checksum:
+            raise PartError("ARTIFACT_VERIFICATION_FAILED")
+        return "local:" + key
 
 
 def query_with_pages(pages):

@@ -1417,7 +1417,6 @@ ASYNC_EXPORT_QUERY_END_MODES = {}
 ASYNC_EXPORT_ADAPTER_FACTORY = "apps.log_search.export.adapter.native_query_factory"
 ASYNC_EXPORT_PART_TASK = "apps.log_search.tasks.sharded_export.execute_sharded_export_part"
 ASYNC_EXPORT_ARTIFACT_STORE_FACTORY = ""
-ASYNC_EXPORT_LOCAL_ARTIFACT_ROOT = ""
 ASYNC_EXPORT_WORKER_POLICY = {}
 ASYNC_EXPORT_PART_RETRY_SECONDS = 10
 ASYNC_EXPORT_COS = {}  # Bucket、Region、SecretId、SecretKey；凭据绝不写入 Job 快照。

@@ -2,9 +2,7 @@
 
 import hashlib
 import gzip
-import os
 import tarfile
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -182,32 +180,6 @@ def package_part(query, part, directory, policy, guard, *, on_packaging=None):
         info.size, info.mode, info.mtime = size, 0o600, 0
         bundle.addfile(info, CheckedFile(stream, guard))
     return Artifact(archive, rows, size, archive.stat().st_size, digest_file(archive, guard))
-
-
-class LocalArtifactStore:
-    """仅用于本地开发的产物落盘，不能替代 COS 或共享存储。"""
-
-    def __init__(self, root):
-        self.root = Path(root).resolve()
-
-    def publish(self, part, artifact, guard):
-        key = f"{part.plan.job_id}/{part.plan.plan_version}/{part.pk}/{artifact.checksum}.tar.gz"
-        target = self.root / key
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # 先完整复制并校验，再原子链接；绝不覆盖已有的获胜对象。
-        with tempfile.NamedTemporaryFile(dir=target.parent) as temporary, artifact.path.open("rb") as source:
-            while block := CheckedFile(source, guard).read(1024 * 1024):
-                temporary.write(block)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            guard()
-            try:
-                os.link(temporary.name, target)
-            except FileExistsError:
-                pass
-        if target.stat().st_size != artifact.compressed_size or digest_file(target, guard) != artifact.checksum:
-            raise PartError("ARTIFACT_VERIFICATION_FAILED")
-        return "local:" + key
 
 
 def run_part(part_id, *, lease_id, query_factory, budget, store, policy=None):

@@ -156,7 +156,6 @@ class Artifact:
     size: int
     compressed_size: int
     checksum: str
-    content_checksum: str = ""
 
 
 def package_part(query, part, directory, policy, guard, *, on_packaging=None):
@@ -165,7 +164,6 @@ def package_part(query, part, directory, policy, guard, *, on_packaging=None):
         raise PartError("UNSUPPORTED_EXPORT_FILE_TYPE")
     member_name = f"logs.{extension}"
     payload = directory / "logs.jsonl"
-    payload_digest = hashlib.sha256()
     size = rows = 0
     reader = RawWithScrollReader(query, part, policy, guard)
     with payload.open("wb") as stream:
@@ -177,7 +175,6 @@ def package_part(query, part, directory, policy, guard, *, on_packaging=None):
                 if size > policy.max_bytes:
                     raise PartError("OVERSIZED")
                 stream.write(data)
-                payload_digest.update(data)
                 rows += 1
             guard.rows = rows
     if not reader.exhausted:
@@ -195,20 +192,7 @@ def package_part(query, part, directory, policy, guard, *, on_packaging=None):
         info = tarfile.TarInfo(member_name)
         info.size, info.mode, info.mtime = size, 0o600, 0
         bundle.addfile(info, CheckedFile(stream, guard))
-    # 回读压缩包；必须与完整的 JSONL 字节完全一致才算成功。
-    with tarfile.open(archive, "r|gz") as bundle:
-        member = bundle.next()
-        if member is None or not member.isfile() or member.name != member_name or member.size != size:
-            raise PartError("ARCHIVE_VERIFICATION_FAILED")
-        digest = hashlib.sha256()
-        with bundle.extractfile(member) as stream:
-            while block := CheckedFile(stream, guard).read(1024 * 1024):
-                digest.update(block)
-        if digest.hexdigest() != payload_digest.hexdigest() or bundle.next() is not None:
-            raise PartError("ARCHIVE_VERIFICATION_FAILED")
-    return Artifact(
-        archive, rows, size, archive.stat().st_size, digest_file(archive, guard), payload_digest.hexdigest()
-    )
+    return Artifact(archive, rows, size, archive.stat().st_size, digest_file(archive, guard))
 
 
 class LocalArtifactStore:
@@ -276,7 +260,6 @@ def run_part(part_id, *, generation, lease_id, query_factory, budget, store, pol
                 compressed_bytes=artifact.compressed_size,
                 object_key=key,
                 checksum=artifact.checksum,
-                content_checksum=artifact.content_checksum,
             )
     except UnconfirmedQueryExit as error:
         if error.code in {"UPLOAD_EXIT_UNCONFIRMED", "BKREPO_RESPONSE_UNCONFIRMED"}:

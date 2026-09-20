@@ -117,7 +117,7 @@ class ArtifactFlowTest(TestCase):
         path = Path(self.temp.name) / "artifact"
         path.write_bytes(content)
         checksum = hashlib.sha256(content).hexdigest()
-        return Artifact(path, 1, len(content), len(content), checksum, checksum)
+        return Artifact(path, 1, len(content), len(content), checksum)
 
     def test_cos_signing_uses_committed_key(self):
         key = "exports/part.tar.gz"
@@ -145,7 +145,6 @@ class ArtifactFlowTest(TestCase):
                 compressed_bytes=artifact.compressed_size,
                 object_key=key,
                 checksum=artifact.checksum,
-                content_checksum=artifact.content_checksum,
             )
         self.job.refresh_from_db()
 
@@ -379,9 +378,7 @@ class ArtifactFlowTest(TestCase):
             key = store.publish_file(self.job, artifact_prefix(self.job) + "wire", artifact, lambda: 2)
             from apps.log_search.export.storage import StoredArtifact
 
-            record = StoredArtifact(
-                key, artifact.checksum, artifact.content_checksum, artifact.compressed_size, store.storage_id
-            )
+            record = StoredArtifact(key, artifact.checksum, artifact.compressed_size, store.storage_id)
             store.verify(record, lambda: 2)
             self.assertEqual(
                 received, [(b"sdk-wire-data", base64.b64encode(hashlib.md5(b"sdk-wire-data").digest()).decode())]
@@ -471,7 +468,7 @@ class BKRepoArtifactStoreTest(TestCase):
         path = Path(self.temp.name) / "artifact"
         path.write_bytes(content)
         checksum = hashlib.sha256(content).hexdigest()
-        return Artifact(path, 1, len(content), len(content), checksum, checksum)
+        return Artifact(path, 1, len(content), len(content), checksum)
 
     def start_part(self):
         part = self.plan.parts.get()

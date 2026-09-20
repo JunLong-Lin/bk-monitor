@@ -25,7 +25,6 @@ def artifact_prefix(job):
 class StoredArtifact:
     object_key: str
     checksum: str
-    content_checksum: str
     size: int
     storage_id: str
 
@@ -48,9 +47,7 @@ class ArtifactStore:
         current = ExportJob.objects.get(pk=job.pk)
         if current.status != ExportJob.Status.RUNNING or not key.startswith(artifact_prefix(current)):
             raise PartError("JOB_STOPPED")
-        record = StoredArtifact(
-            key, artifact.checksum, artifact.content_checksum, artifact.compressed_size, self.storage_id
-        )
+        record = StoredArtifact(key, artifact.checksum, artifact.compressed_size, self.storage_id)
         existing = self.head(key, guard)
         if existing is None:
             md5 = hashlib.md5()  # 传输校验，不用于身份或安全判定。
@@ -109,11 +106,7 @@ class CosArtifactStore(ArtifactStore):
         if metadata is None:
             raise PartError("ARTIFACT_MISSING")
         metadata = {k.lower(): str(v) for k, v in metadata.items()}
-        if (
-            metadata.get("content-length") != str(record.size)
-            or metadata.get("x-cos-meta-sha256") != record.checksum
-            or metadata.get("x-cos-meta-content-sha256", "") != record.content_checksum
-        ):
+        if metadata.get("content-length") != str(record.size) or metadata.get("x-cos-meta-sha256") != record.checksum:
             raise PartError("ARTIFACT_VERIFICATION_FAILED")
 
     def upload(self, record, artifact, guard, md5_digest):
@@ -129,7 +122,6 @@ class CosArtifactStore(ArtifactStore):
                         ContentMD5=base64.b64encode(md5_digest).decode(),
                         Metadata={
                             "x-cos-meta-sha256": record.checksum,
-                            "x-cos-meta-content-sha256": record.content_checksum,
                         },
                     )
                     return

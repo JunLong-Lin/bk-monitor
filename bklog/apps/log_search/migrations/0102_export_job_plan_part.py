@@ -269,10 +269,6 @@ class Migration(migrations.Migration):
                     models.CharField(blank=True, default="", max_length=1024, verbose_name="获胜产物对象键"),
                 ),
                 ("checksum", models.CharField(blank=True, default="", max_length=64, verbose_name="获胜产物SHA256")),
-                (
-                    "content_checksum",
-                    models.CharField(blank=True, default="", max_length=64, verbose_name="日志内容SHA256"),
-                ),
                 ("published_at", models.DateTimeField(blank=True, null=True, verbose_name="消息发布时间")),
                 ("started_at", models.DateTimeField(blank=True, null=True, verbose_name="本次执行开始时间")),
                 ("finished_at", models.DateTimeField(blank=True, null=True, verbose_name="本次执行完成时间")),

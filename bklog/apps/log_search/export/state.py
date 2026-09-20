@@ -501,7 +501,6 @@ def complete_part(
     compressed_bytes,
     object_key,
     checksum,
-    content_checksum="",
 ):
     if (
         any(type(value) is not int or value < 0 for value in (actual_rows, actual_bytes, compressed_bytes))
@@ -524,7 +523,6 @@ def complete_part(
             processed_rows=actual_rows,
             object_key=object_key,
             checksum=checksum,
-            content_checksum=content_checksum,
             lease_id="",
             lease_until=None,
             heartbeat_at=None,

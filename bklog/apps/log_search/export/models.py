@@ -170,7 +170,6 @@ class ExportPart(PlanningRecord):
     worker_id = models.CharField(_("执行进程标识"), max_length=255, blank=True, default="")
     object_key = models.CharField(_("获胜产物对象键"), max_length=1024, blank=True, default="")
     checksum = models.CharField(_("获胜产物SHA256"), max_length=64, blank=True, default="")
-    content_checksum = models.CharField(_("日志内容SHA256"), max_length=64, blank=True, default="")
     published_at = models.DateTimeField(_("消息发布时间"), null=True, blank=True)
     started_at = models.DateTimeField(_("本次执行开始时间"), null=True, blank=True)
     finished_at = models.DateTimeField(_("本次执行完成时间"), null=True, blank=True)

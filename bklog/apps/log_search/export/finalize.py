@@ -31,7 +31,7 @@ def manifest_snapshot(job, store_id):
             raise PartError("MANIFEST_COUNTS_INVALID")
         if not part.object_key or not part.checksum or not part.object_key.startswith(artifact_prefix(job)):
             raise PartError("MANIFEST_ARTIFACT_INVALID")
-        record = StoredArtifact(part.object_key, part.checksum, part.content_checksum, part.compressed_bytes, store_id)
+        record = StoredArtifact(part.object_key, part.checksum, part.compressed_bytes, store_id)
         records.append(record)
         entries.append(
             dict(
@@ -44,7 +44,6 @@ def manifest_snapshot(job, store_id):
                 compressed_bytes=part.compressed_bytes,
                 object_key=part.object_key,
                 checksum=part.checksum,
-                content_checksum=record.content_checksum,
                 checksum_algorithm="sha256",
             )
         )
@@ -109,7 +108,7 @@ def finalize_export(job_id, store):
         with export_temporary_directory("manifest") as directory:
             path = Path(directory) / "manifest.json"
             path.write_bytes(content)
-            artifact = Artifact(path, 0, len(content), len(content), checksum, checksum)
+            artifact = Artifact(path, 0, len(content), len(content), checksum)
             store.publish_file(job, key, artifact, guard)
         guard()
         return state.finalize_job_success(
@@ -146,9 +145,7 @@ def cleanup_export(job_id, store, limit=100):
         records = [
             (
                 part,
-                StoredArtifact(
-                    part.object_key, part.checksum, part.content_checksum, part.compressed_bytes, store.storage_id
-                ),
+                StoredArtifact(part.object_key, part.checksum, part.compressed_bytes, store.storage_id),
             )
             for part in parts
         ]
@@ -157,7 +154,7 @@ def cleanup_export(job_id, store, limit=100):
                 (
                     None,
                     StoredArtifact(
-                        job.manifest_object_key, job.manifest_checksum, "", job.manifest_bytes or 0, store.storage_id
+                        job.manifest_object_key, job.manifest_checksum, job.manifest_bytes or 0, store.storage_id
                     ),
                 )
             )

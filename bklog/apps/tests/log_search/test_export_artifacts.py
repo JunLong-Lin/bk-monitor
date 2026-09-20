@@ -131,8 +131,8 @@ class ArtifactFlowTest(TestCase):
                 part.pk, lease_id="owner", task_id="task", lease_until=timezone.now() + timedelta(seconds=60)
             )
             part.refresh_from_db()
-            credentials = dict(generation=part.dispatch_generation, lease_id="owner")
-            state.claim_part(part.pk, **credentials, worker_id="worker")
+            credentials = dict(lease_id="owner")
+            part = state.claim_part(part.pk, **credentials)
             state.begin_part_upload(part.pk, **credentials)
             part.plan.job.refresh_from_db()
             artifact = self.artifact(str(part.pk).encode())
@@ -171,12 +171,12 @@ class ArtifactFlowTest(TestCase):
         self.assertEqual(self.store.publish(part, artifact, lambda: 30), part.object_key)
         self.assertEqual(self.client.puts, puts)
 
-    def test_retry_generation_uses_another_object_key(self):
+    def test_retry_uses_another_object_key(self):
         self.complete_parts()
         part = self.plan.parts.first()
         artifact = self.artifact(str(part.pk).encode())
         original_key = part.object_key
-        part.dispatch_generation += 1
+        part.attempts = 2
         retry_key = self.store.publish(part, artifact, lambda: 30)
         self.assertNotEqual(retry_key, original_key)
         self.assertIn(original_key, self.client.objects)
@@ -406,7 +406,6 @@ class ArtifactFlowTest(TestCase):
             part.refresh_from_db()
             run_part(
                 part.pk,
-                generation=part.dispatch_generation,
                 lease_id="owner",
                 query_factory=query,
                 budget=Mock(renew=Mock(return_value=True)),
@@ -428,7 +427,6 @@ class ArtifactFlowTest(TestCase):
         with patch.object(self.client, "put_object", side_effect=TimeoutError()):
             run_part(
                 part.pk,
-                generation=part.dispatch_generation,
                 lease_id="owner",
                 query_factory=query,
                 budget=budget,
@@ -476,8 +474,8 @@ class BKRepoArtifactStoreTest(TestCase):
             part.pk, lease_id="owner", task_id="task", lease_until=timezone.now() + timedelta(seconds=60)
         )
         part.refresh_from_db()
-        credentials = dict(generation=part.dispatch_generation, lease_id="owner")
-        state.claim_part(part.pk, **credentials, worker_id="worker")
+        credentials = dict(lease_id="owner")
+        part = state.claim_part(part.pk, **credentials)
         state.begin_part_upload(part.pk, **credentials)
         part.plan.job.refresh_from_db()
         return part, credentials
@@ -550,7 +548,9 @@ class BKRepoArtifactStoreTest(TestCase):
     def test_existing_wrong_object_is_not_overwritten(self):
         part, _credentials = self.start_part()
         artifact = self.artifact()
-        key = f"{artifact_prefix(self.job)}{self.plan.plan_version}/{part.pk}/{part.dispatch_generation}/{artifact.checksum}.tar.gz"
+        key = (
+            f"{artifact_prefix(self.job)}{self.plan.plan_version}/{part.pk}/{part.attempts}/{artifact.checksum}.tar.gz"
+        )
         self.client.objects[self.store._key(key)] = b"wrong", "bad-checksum"
         with self.assertRaisesMessage(PartError, "ARTIFACT_VERIFICATION_FAILED"):
             self.store.publish(part, artifact, lambda: 30)

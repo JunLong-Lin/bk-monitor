@@ -3,7 +3,6 @@
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import asdict
 from types import SimpleNamespace
 
 from django.conf import settings
@@ -12,7 +11,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from apps.log_search.export import admission
 from apps.log_search.export.adapter import export_identity, projection_snapshot
 from apps.log_search.export.api import ExportConflict, authorized_scope, job_detail
-from apps.log_search.export.contracts import ExportStateError, PlannerPolicy
+from apps.log_search.export.contracts import ExportStateError
 from apps.log_search.export.models import ExportJob
 from apps.log_search.handlers.search.search_handlers_esquery import SearchHandler
 from apps.log_search.models import AsyncTask
@@ -93,7 +92,6 @@ def create_export(request, data):
         if not base.get("query_list"):
             raise ValidationError("INCOMPLETE_ROUTING_SNAPSHOT")
         projection = projection_snapshot(handler)
-    policy = PlannerPolicy.for_job(SimpleNamespace(policy_snapshot={}))
     query_snapshot = {
         "search_params": params,
         "unify_query": base,
@@ -108,10 +106,7 @@ def create_export(request, data):
         request_id=data["request_id"],
         query_kind="single",
         index_set_ids=[index.pk],
-        resolved_resource_ids=[f"index:{index.pk}"],
         query_snapshot=query_snapshot,
-        routing_snapshot={"query_list": deepcopy(base["query_list"])},
-        policy_snapshot={"query_end_mode": end_mode, "planner": asdict(policy)},
         start_time=data["start_time"],
         end_time=data["end_time"],
         time_tick=tick,

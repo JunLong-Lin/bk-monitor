@@ -14,7 +14,7 @@ from apps.log_unifyquery.handler.base import UnifyQueryHandler
 from apps.utils.local import activate_request, del_local_param, get_local_param, get_request, set_local_param
 
 
-@override_settings(ASYNC_EXPORT_VERIFIED_QUERY_KINDS=["single"])
+@override_settings(ASYNC_EXPORT_VERIFIED_QUERY_KINDS=["single"], ASYNC_EXPORT_QUERY_END_MODES={"single": "exclusive"})
 class NativeAdapterTest(SimpleTestCase):
     def setUp(self):
         self.base = {
@@ -30,15 +30,12 @@ class NativeAdapterTest(SimpleTestCase):
             created_by="alice",
             space_uid="bkcc__2",
             source_app_code="bk_log",
-            resolved_resource_ids=["index:1"],
             time_tick=1,
-            policy_snapshot={"query_end_mode": "exclusive"},
             query_snapshot={
                 "time_units_per_second": 1,
                 "unify_query": self.base,
                 "search_params": {"index_set_ids": [1], "bk_biz_id": 2},
             },
-            routing_snapshot={"query_list": deepcopy(self.base["query_list"])},
         )
         space = patch(
             "apps.log_search.export.adapter.Space.objects.get",

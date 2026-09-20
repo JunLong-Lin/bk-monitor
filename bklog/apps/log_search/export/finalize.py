@@ -88,12 +88,7 @@ def finalize_export(job_id, store):
     def guard():
         remaining = deadline - time.monotonic()
         current = ExportJob.objects.get(pk=job.pk)
-        if (
-            remaining <= 0
-            or current.status != ExportJob.Status.RUNNING
-            or current.state_version != job.state_version
-            or current.finalization_attempts != attempt
-        ):
+        if remaining <= 0 or current.status != ExportJob.Status.RUNNING or current.finalization_attempts != attempt:
             raise PartError("FINALIZATION_STOPPED")
         return remaining
 

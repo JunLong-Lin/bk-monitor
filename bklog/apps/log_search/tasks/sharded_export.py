@@ -23,7 +23,7 @@ def publish_part(part):
         settings.ASYNC_EXPORT_PART_TASK,
         args=[part.pk],
         task_id=part.task_id,
-        headers={"export_generation": part.dispatch_generation, "export_lease_id": part.lease_id},
+        headers={"export_lease_id": part.lease_id},
         queue=settings.ASYNC_EXPORT_OVERSIZED_QUEUE if part.oversized else settings.ASYNC_EXPORT_QUEUE,
         retry=False,
     )
@@ -47,15 +47,14 @@ def execute_sharded_export_part(self, part_id):
     if not settings.ASYNC_EXPORT_CONTROL_ENABLED:
         return
     headers = self.request.headers or {}
-    generation, owner = headers.get("export_generation"), headers.get("export_lease_id")
-    if type(generation) is not int or generation < 1 or not isinstance(owner, str) or not owner:
+    owner = headers.get("export_lease_id")
+    if not isinstance(owner, str) or not owner:
         return
     if not settings.ASYNC_EXPORT_ARTIFACT_STORE_FACTORY:
         raise BudgetUnavailable("Part artifact store is not configured")
     cleanup_temporary_files()
     run_part(
         part_id,
-        generation=generation,
         lease_id=owner,
         query_factory=adapter_factory(),
         budget=RedisBudget(get_redis_connection("default"), settings.ASYNC_EXPORT_NAMESPACE),
@@ -93,7 +92,7 @@ def coordinate_sharded_exports():
     """启用并配置好链路之后才安装周期调度。
 
     重复扫描用于补回缺失的规划、投递、拆分和收尾消息；Worker 必须使用
-    generation/lease 请求头，不能只依赖 part_id。
+    lease 请求头，不能只依赖 part_id。
     """
     if not settings.ASYNC_EXPORT_CONTROL_ENABLED:
         return
@@ -118,7 +117,6 @@ def coordinate_sharded_exports():
             else:
                 task = plan_sharded_export if kind == "plan" else split_sharded_export
                 task.apply_async(args=[identifier], queue=settings.ASYNC_EXPORT_CONTROL_QUEUE, retry=False)
-        coordinator.replay(limit=limit, reconcile=False)
         coordinator.tick(max_dispatches=limit, reconcile=False)
         if settings.ASYNC_EXPORT_FINALIZE_TASK:
             for job_id in coordinator.cleanup_jobs(limit):

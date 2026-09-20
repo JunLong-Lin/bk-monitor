@@ -160,11 +160,11 @@ class PlanningStateTest(TestCase):
         job = create_job(end_time=10)
         plan = plan_job(job.pk, lambda job: Distribution({1: 1}))
         part = plan.parts.get()
-        dispatched = state.dispatch_part(
+        state.dispatch_part(
             part.pk, lease_id="lease", task_id="task", lease_until=timezone.now() + timedelta(minutes=1)
         )
-        state.claim_part(part.pk, generation=dispatched.dispatch_generation, lease_id="lease", worker_id="worker")
-        state.retry_part(part.pk, generation=1, lease_id="lease", error_code="OVERSIZED", error_detail="")
+        state.claim_part(part.pk, lease_id="lease")
+        state.retry_part(part.pk, lease_id="lease", error_code="OVERSIZED", error_detail="")
         children = replan_failed_part(part.pk, lambda job: Distribution({1: 1}))
         self.assertEqual(len(children), 2)
         part.refresh_from_db()
@@ -195,8 +195,8 @@ class PlanningStateTest(TestCase):
         state.dispatch_part(
             part.pk, lease_id="lease", task_id="task", lease_until=timezone.now() + timedelta(minutes=1)
         )
-        state.claim_part(part.pk, generation=1, lease_id="lease", worker_id="worker")
-        state.retry_part(part.pk, generation=1, lease_id="lease", error_code="OVERSIZED", error_detail="")
+        state.claim_part(part.pk, lease_id="lease")
+        state.retry_part(part.pk, lease_id="lease", error_code="OVERSIZED", error_detail="")
         for _ in range(3):
             ExportPart.objects.filter(pk=part.pk).update(next_planning_at=None)
             replan_failed_part(part.pk, Mock(side_effect=TimeoutError))
@@ -286,13 +286,6 @@ class PlanningStateTest(TestCase):
             )
         self.assertFalse(job.plans.exists())
 
-    @override_settings(ASYNC_EXPORT_PLANNER_POLICY={"max_rows": 2})
-    def test_job_policy_cannot_raise_deployment_admission_limit(self):
-        job = create_job(policy_snapshot={"planner": {"max_rows": 100}})
-        plan_job(job.pk, lambda current: Distribution({1: 3}))
-        job.refresh_from_db()
-        self.assertEqual(job.error_code, "QUOTA_EXCEEDED")
-
     def test_local_planning_uses_the_same_lease_fence_and_overall_deadline(self):
         job = create_job()
         plan = plan_job(job.pk, lambda current: Distribution({}))
@@ -314,7 +307,7 @@ class PlanningStateTest(TestCase):
         self.assertEqual(job.error_code, "PLANNING_TIMEOUT")
 
 
-@override_settings(ASYNC_EXPORT_VERIFIED_QUERY_KINDS=["union"])
+@override_settings(ASYNC_EXPORT_VERIFIED_QUERY_KINDS=["union"], ASYNC_EXPORT_QUERY_END_MODES={"union": "inclusive"})
 class UnifyQueryStatisticsTest(TestCase):
     def adapter(self, **overrides):
         query = {
@@ -329,8 +322,6 @@ class UnifyQueryStatisticsTest(TestCase):
             query_kind="union",
             time_tick=1,
             query_snapshot={"unify_query": query, "time_units_per_second": 1000},
-            routing_snapshot={"query_list": query["query_list"]},
-            policy_snapshot={"query_end_mode": "inclusive"},
         )
         return UnifyQueryStatistics(
             job,

@@ -3,7 +3,6 @@
 import hashlib
 import gzip
 import os
-import socket
 import tarfile
 import tempfile
 import time
@@ -92,7 +91,6 @@ class AttemptGuard:
     def __init__(self, part, budget, policy, credentials):
         self.part, self.budget, self.credentials = part, budget, credentials
         self.deadline = time.monotonic() + policy.deadline
-        self.rows = 0
 
     def __call__(self):
         remaining = self.deadline - time.monotonic()
@@ -108,7 +106,6 @@ class AttemptGuard:
             self.part.pk,
             **self.credentials,
             lease_until=timezone.now() + timedelta(seconds=lease_seconds),
-            processed_rows=self.rows,
         )
         # 留出余量，确保租约到期前还能观察到响应。
         return min(remaining, lease_seconds / 2)
@@ -172,7 +169,6 @@ def package_part(query, part, directory, policy, guard, *, on_packaging=None):
                     raise PartError("OVERSIZED")
                 stream.write(data)
                 rows += 1
-            guard.rows = rows
     if not reader.exhausted:
         raise PartError("SOURCE_NOT_EXHAUSTED")
     guard()
@@ -217,18 +213,11 @@ class LocalArtifactStore:
         return "local:" + key
 
 
-def local_artifact_store():
-    root = settings.ASYNC_EXPORT_LOCAL_ARTIFACT_ROOT
-    if os.environ.get("BKPAAS_ENVIRONMENT") != "dev" or not root:
-        raise ValueError("local artifacts require dev and an explicit isolated directory")
-    return LocalArtifactStore(root)
-
-
-def run_part(part_id, *, generation, lease_id, query_factory, budget, store, policy=None):
+def run_part(part_id, *, lease_id, query_factory, budget, store, policy=None):
     policy = policy or WorkerPolicy(**settings.ASYNC_EXPORT_WORKER_POLICY)
-    credentials = dict(generation=generation, lease_id=lease_id)
+    credentials = dict(lease_id=lease_id)
     try:
-        part = state.claim_part(part_id, **credentials, worker_id=f"{socket.gethostname()}:{os.getpid()}")
+        part = state.claim_part(part_id, **credentials)
     except ExportStateError:
         return  # 重复、已取消或过期的投递不会发起任何查询 I/O。
     guard = AttemptGuard(part, budget, policy, credentials)
@@ -270,6 +259,6 @@ def run_part(part_id, *, generation, lease_id, query_factory, budget, store, pol
         except ExportStateError:
             return
     try:
-        budget.release(part.pk, generation, lease_id)
+        budget.release(part.pk, lease_id)
     except BudgetUnavailable:
         logger.warning("sharded export completed I/O; ledger release awaits reconciliation")

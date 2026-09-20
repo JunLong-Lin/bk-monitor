@@ -68,17 +68,12 @@ class PlannerPolicy:
             raise PlanningError("INVALID_PLANNER_POLICY")
 
     @classmethod
-    def for_job(cls, job):
+    def configured(cls):
         try:
-            configured = cls(**settings.ASYNC_EXPORT_PLANNER_POLICY)
-            policy = cls(**{**vars(configured), **job.policy_snapshot.get("planner", {})})
+            policy = cls(**settings.ASYNC_EXPORT_PLANNER_POLICY)
         except (TypeError, ValueError) as exc:
             raise PlanningError("INVALID_PLANNER_POLICY") from exc
-        return replace(
-            policy,
-            max_rows=min(policy.max_rows, configured.max_rows),
-            max_parts=min(policy.max_parts, configured.max_parts, settings.ASYNC_EXPORT_MAX_LEAF_PARTS),
-        )
+        return replace(policy, max_parts=min(policy.max_parts, settings.ASYNC_EXPORT_MAX_LEAF_PARTS))
 
 
 def nonnegative_integer(value):

@@ -90,7 +90,6 @@ def native_query_factory(job):
     if (
         not job.created_by
         or params.get("index_set_ids") != job.index_set_ids
-        or job.resolved_resource_ids != [f"index:{index_id}"]
         or params.get("original_search")
         or params.get("is_desensitize") is False
     ):

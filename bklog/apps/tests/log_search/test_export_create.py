@@ -175,8 +175,6 @@ class CreateExportTest(TestCase):
         self.assertEqual(data, original)
         self.assertIs(get_request(peaceful=True), previous)
         self.assertEqual((result["status"], result["estimated_total"], result["parts_total"]), ("PENDING", None, 0))
-        self.assertEqual(job.resolved_resource_ids, ["index:1"])
-        self.assertEqual(job.policy_snapshot["planner"]["max_rows"], 5_000_000)
         self.assertEqual(job.query_snapshot["search_params"]["sort_list"], [["timestamp", "desc"]])
         self.assertTrue(job.query_snapshot["search_params"]["is_desensitize"])
         self.assertEqual(job.query_snapshot["projection"]["export_fields"], ["message"])
@@ -274,10 +272,10 @@ class CreateExportTest(TestCase):
                     pass
 
     def test_inclusive_protocol_adjusts_only_reader_end_and_group_drift_is_rejected(self):
-        with override_settings(ASYNC_EXPORT_QUERY_END_MODES={"single": "inclusive"}):
-            result = create_export(None, inputs())
+        result = create_export(None, inputs())
         job = ExportJob.objects.get(pk=result["job_id"])
         with (
+            override_settings(ASYNC_EXPORT_QUERY_END_MODES={"single": "inclusive"}),
             patch("apps.log_search.export.adapter.UnifyQueryHandler", side_effect=self.handler),
             patch("apps.log_search.export.adapter.PlatformAwareIndexSearchPermission") as permission,
         ):

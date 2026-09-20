@@ -51,16 +51,16 @@ class ExportAPITest(TestCase):
             parts=[state.PartSpec(1, 0, 30, 5, 10), state.PartSpec(2, 30, 60, 5, 10)],
         )
 
-    def test_progress_uses_current_successful_leaves_and_attempt_rows(self):
+    def test_progress_uses_current_successful_leaves(self):
         plan = self.plan()
         first, second = list(plan.parts.order_by("part_no"))
-        ExportPart.objects.filter(pk=first.pk).update(status="SUCCESS", actual_rows=7, processed_rows=999)
-        ExportPart.objects.filter(pk=second.pk).update(status="RUNNING", processed_rows=4, stage="PACKAGE")
+        ExportPart.objects.filter(pk=first.pk).update(status="SUCCESS", actual_rows=7)
+        ExportPart.objects.filter(pk=second.pk).update(status="RUNNING", stage="PACKAGE")
         detail = job_detail(self.job.pk)
-        self.assertEqual((detail["actual_total"], detail["processed_rows"], detail["percent"]), (7, 11, 50))
+        self.assertEqual((detail["actual_total"], detail["percent"]), (7, 50))
         self.assertEqual(detail["stage"], "PACKAGE")
         ExportPart.objects.filter(pk=second.pk).update(status="FAILED")
-        self.assertEqual(job_detail(self.job.pk)["processed_rows"], 7)
+        self.assertEqual(job_detail(self.job.pk)["actual_total"], 7)
         ExportPart.objects.filter(pk=second.pk).update(status="SUCCESS", actual_rows=6)
         detail = job_detail(self.job.pk)
         self.assertEqual((detail["actual_total"], detail["percent"], detail["stage"]), (13, 99, "FINALIZING"))
@@ -87,9 +87,8 @@ class ExportAPITest(TestCase):
         self.assertNotIn("private", str(detail))
 
     def test_cancel_idempotent_and_terminal_parallelism_conflicts(self):
-        first = operate_job(self.job.pk)
+        operate_job(self.job.pk)
         second = operate_job(self.job.pk)
-        self.assertEqual(first["state_version"], second["state_version"])
         self.assertEqual(second["status"], "CANCELED")
         with self.assertRaises(ExportConflict):
             operate_job(self.job.pk, parallelism=2)

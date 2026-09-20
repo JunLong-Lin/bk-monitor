@@ -12,7 +12,7 @@ import redis
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from apps.log_search.export.coordinator import BudgetUnavailable, Coordinator, Limits, PublishNotSent, RedisBudget
+from apps.log_search.export.coordinator import BudgetUnavailable, Coordinator, Limits, RedisBudget
 from apps.log_search.export.models import ExportJob, ExportPart
 from apps.tests.log_search.export_fixtures import create_job
 from apps.log_search.export import state
@@ -72,9 +72,9 @@ class CoordinatorTest(TestCase):
             self.budget, self.publish, namespace="test-environment", limits=Limits(8, 4, 1, 60)
         )
 
-    def ready(self, *, resources=None, parallelism=4, oversized=False):
+    def ready(self, *, index_set_ids=None, parallelism=4, oversized=False):
         job = create_job(
-            resolved_resource_ids=resources or ["index:1"],
+            index_set_ids=index_set_ids or [1],
             requested_parallelism=parallelism,
             end_time=10,
         )
@@ -99,9 +99,9 @@ class CoordinatorTest(TestCase):
         self.assertEqual(len(sent), 4)
 
     def test_union_consumes_all_indexes_atomically(self):
-        union, _ = self.ready(resources=["index:A", "index:B"])
-        single, _ = self.ready(resources=["index:B"])
-        other, _ = self.ready(resources=["index:C"])
+        union, _ = self.ready(index_set_ids=[1, 2])
+        single, _ = self.ready(index_set_ids=[2])
+        other, _ = self.ready(index_set_ids=[3])
         self.coordinator.tick()
         self.assertEqual(
             ExportPart.objects.filter(plan__job_id__in=[union.pk, single.pk], status="DISPATCHED").count(), 4
@@ -109,8 +109,8 @@ class CoordinatorTest(TestCase):
         self.assertEqual(ExportPart.objects.filter(plan__job=other, status="DISPATCHED").count(), 4)
 
     def test_distinct_indexes_share_global_capacity(self):
-        self.ready(resources=["index:1"])
-        self.ready(resources=["index:2"])
+        self.ready(index_set_ids=[1])
+        self.ready(index_set_ids=[2])
         self.assertEqual(len(self.coordinator.tick()), 8)
 
     def test_tick_rebuilds_ledger_once_for_multiple_reservations(self):
@@ -127,7 +127,7 @@ class CoordinatorTest(TestCase):
         job, _ = self.ready()
         self.coordinator.tick()
         for part in ExportPart.objects.filter(status="DISPATCHED"):
-            state.claim_part(part.pk, generation=part.dispatch_generation, lease_id=part.lease_id, worker_id="worker")
+            state.claim_part(part.pk, lease_id=part.lease_id)
         state.cancel_job(job.pk)
         ExportPart.objects.filter(status="RUNNING").update(lease_until=timezone.now() - timedelta(seconds=1))
         self.redis_client.delete(self.budget.key)
@@ -140,13 +140,12 @@ class CoordinatorTest(TestCase):
     def test_expired_running_execution_keeps_its_reservation(self):
         _, plan = self.ready()
         part = self.coordinator.reserve()
-        state.claim_part(part.pk, generation=1, lease_id=part.lease_id, worker_id="worker")
+        state.claim_part(part.pk, lease_id=part.lease_id)
         ExportPart.objects.filter(pk=part.pk).update(lease_until=timezone.now() - timedelta(seconds=1))
         self.assertEqual(self.coordinator.recover_expired(), [part.pk])
         part.refresh_from_db()
         self.assertEqual(part.status, "RUNNING")
         self.assertEqual(part.attempts, 1)
-        self.assertEqual(part.dispatch_generation, 1)
 
     def test_expired_unclaimed_delivery_can_be_released_without_io_proof(self):
         self.ready()
@@ -157,24 +156,11 @@ class CoordinatorTest(TestCase):
         self.assertEqual(part.status, "WAITING")
         self.assertEqual(part.attempts, 0)
         with self.assertRaises(state.StaleExportUpdateError):
-            state.claim_part(part.pk, generation=1, lease_id="old", worker_id="worker")
+            state.claim_part(part.pk, lease_id="old")
 
-    def test_uncertain_broker_publish_replays_same_generation_and_task_id(self):
+    def test_publish_failure_returns_waiting_without_attempt(self):
         self.ready()
-        self.publish.side_effect = TimeoutError("broker response lost")
-        result = self.coordinator.tick()
-        self.assertEqual(result[0][1], "uncertain")
-        part = ExportPart.objects.get(pk=result[0][0])
-        self.assertIsNone(part.published_at)
-        self.publish.side_effect = None
-        self.coordinator.replay()
-        replayed = self.publish.call_args.args[0]
-        self.assertEqual(replayed.task_id, part.task_id)
-        self.assertEqual(replayed.dispatch_generation, part.dispatch_generation)
-
-    def test_definite_publish_failure_returns_waiting_without_attempt(self):
-        self.ready()
-        self.publish.side_effect = PublishNotSent()
+        self.publish.side_effect = RuntimeError("broker unavailable")
         result = self.coordinator.tick()
         part = ExportPart.objects.get(pk=result[0][0])
         self.assertEqual(part.status, "WAITING")
@@ -184,7 +170,7 @@ class CoordinatorTest(TestCase):
     def test_publish_failure_does_not_release_budget_before_db_commit(self):
         self.ready()
         part = self.coordinator.reserve()
-        self.publish.side_effect = PublishNotSent()
+        self.publish.side_effect = RuntimeError("broker unavailable")
         original_gate = self.coordinator.gate
 
         @contextmanager
@@ -199,13 +185,6 @@ class CoordinatorTest(TestCase):
         self.assertEqual(part.status, ExportPart.Status.DISPATCHED)
         self.assertTrue(self.redis_client.hexists(self.budget.key, str(part.pk)))
 
-    def test_crash_after_db_commit_is_discovered_by_replay(self):
-        self.ready()
-        part = self.coordinator.reserve()
-        self.publish.assert_not_called()
-        self.coordinator.replay()
-        self.assertEqual(self.publish.call_args.args[0].pk, part.pk)
-
     def test_redis_outage_fails_closed_without_creating_dispatch(self):
         self.ready()
         with (
@@ -219,12 +198,11 @@ class CoordinatorTest(TestCase):
     def test_old_owner_cannot_release_new_owner_or_renew_expired_lease(self):
         self.ready()
         part = self.coordinator.reserve()
-        self.assertFalse(self.budget.release(part.pk, 2, part.lease_id))
-        self.assertFalse(self.budget.release(part.pk, 1, "wrong"))
+        self.assertFalse(self.budget.release(part.pk, "wrong"))
         self.assertTrue(self.redis_client.hexists(self.budget.key, str(part.pk)))
         future = part.lease_until + timedelta(seconds=1)
         with patch("apps.log_search.export.coordinator.timezone.now", return_value=future):
-            self.assertFalse(self.budget.renew(part.pk, 1, part.lease_id, future + timedelta(minutes=1)))
+            self.assertFalse(self.budget.renew(part.pk, part.lease_id, future + timedelta(minutes=1)))
 
     def test_db_rollback_after_reservation_leaves_no_dispatch_and_rebuild_removes_orphan(self):
         self.ready()
@@ -233,7 +211,7 @@ class CoordinatorTest(TestCase):
                 self.coordinator.reserve()
         self.assertFalse(ExportPart.objects.filter(status="DISPATCHED").exists())
         self.coordinator.reconcile()
-        self.assertEqual(self.redis_client.hlen(self.budget.key), 1)  # 只剩 epoch
+        self.assertEqual(self.redis_client.hlen(self.budget.key), 1)  # 只剩 _built 哨兵
 
     def test_parallelism_reduction_waits_for_existing_work(self):
         from apps.log_search.export.state import set_parallelism
@@ -270,16 +248,13 @@ class CoordinatorTest(TestCase):
         from concurrent.futures import ThreadPoolExecutor
 
         _, plan = self.ready(parallelism=8)
-        epoch = self.budget.rebuild([])
+        self.budget.rebuild([])
         candidates = list(plan.parts.select_related("plan__job"))
         for part in candidates:
             part.lease_id = f"lease-{part.pk}"
-            part.dispatch_generation = 1
             part.lease_until = timezone.now() + timedelta(minutes=1)
         with ThreadPoolExecutor(max_workers=10) as pool:
-            outcomes = list(
-                pool.map(lambda part: self.budget.acquire(part, epoch, self.coordinator.limits), candidates)
-            )
+            outcomes = list(pool.map(lambda part: self.budget.acquire(part, self.coordinator.limits), candidates))
         self.assertEqual(sum(outcomes), 4)
 
     def test_busy_oversized_budget_does_not_block_ordinary_sibling(self):
@@ -294,18 +269,18 @@ class CoordinatorTest(TestCase):
         part = self.coordinator.reserve()
         stale = ExportPart.objects.get(pk=part.pk)
         ExportPart.objects.filter(pk=part.pk).update(
-            dispatch_generation=2, lease_until=timezone.now() + timedelta(minutes=1)
+            lease_id="changed", lease_until=timezone.now() + timedelta(minutes=1)
         )
         self.assertFalse(state.recover_expired_part(stale))
         part.refresh_from_db()
         self.assertEqual(part.status, "DISPATCHED")
-        self.assertEqual(part.dispatch_generation, 2)
+        self.assertEqual(part.lease_id, "changed")
 
     def test_unconfirmed_execution_does_not_starve_later_expired_dispatch(self):
         self.ready()
         first = self.coordinator.reserve()
         second = self.coordinator.reserve()
-        state.claim_part(first.pk, generation=1, lease_id=first.lease_id, worker_id="worker")
+        state.claim_part(first.pk, lease_id=first.lease_id)
         ExportPart.objects.filter(pk__in=[first.pk, second.pk]).update(
             lease_until=timezone.now() - timedelta(seconds=1)
         )
@@ -315,14 +290,6 @@ class CoordinatorTest(TestCase):
         self.assertEqual(second.status, "WAITING")
         first.refresh_from_db()
         self.assertEqual(first.status, "RUNNING")
-
-    def test_bounded_replay_rotates_past_a_delivery_that_stays_queued(self):
-        self.ready()
-        first = self.coordinator.reserve()
-        second = self.coordinator.reserve()
-        self.coordinator.replay(limit=1)
-        self.coordinator.replay(limit=1)
-        self.assertEqual([call.args[0].pk for call in self.publish.call_args_list], [first.pk, second.pk])
 
     def test_planning_scans_rotate_even_when_messages_never_start(self):
         first = create_job()
@@ -441,7 +408,7 @@ class ControlTasksTest(TestCase):
         logger.warning.assert_called_once()
 
     @override_settings(ASYNC_EXPORT_PART_TASK="worker.part")
-    def test_publish_uses_only_part_id_and_generation_headers(self):
+    def test_publish_uses_only_part_id_and_lease_headers(self):
         from apps.log_search.tasks.sharded_export import publish_part
 
         job = create_job()
@@ -462,7 +429,7 @@ class ControlTasksTest(TestCase):
             publish_part(part)
         self.assertEqual(send.call_args.kwargs["args"], [part.pk])
         self.assertEqual(send.call_args.kwargs["task_id"], "task")
-        self.assertEqual(send.call_args.kwargs["headers"], {"export_generation": 1, "export_lease_id": "owner"})
+        self.assertEqual(send.call_args.kwargs["headers"], {"export_lease_id": "owner"})
         self.assertFalse(send.call_args.kwargs["retry"])
 
     @override_settings(

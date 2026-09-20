@@ -50,9 +50,6 @@ class Migration(migrations.Migration):
                 ("index_set_ids", models.JSONField(blank=True, default=list, verbose_name="原始索引集ID")),
                 ("query_snapshot", models.JSONField(verbose_name="规范化查询快照")),
                 ("query_hash", models.CharField(max_length=64, verbose_name="查询摘要")),
-                ("routing_snapshot", models.JSONField(blank=True, default=dict, verbose_name="固定路由快照")),
-                ("resolved_resource_ids", models.JSONField(blank=True, default=list, verbose_name="完整资源集合")),
-                ("policy_snapshot", models.JSONField(blank=True, default=dict, verbose_name="执行策略快照")),
                 ("start_time", models.BigIntegerField(verbose_name="包含的时间下界")),
                 ("end_time", models.BigIntegerField(verbose_name="不包含的时间上界")),
                 (
@@ -100,7 +97,6 @@ class Migration(migrations.Migration):
                         verbose_name="当前有效计划版本",
                     ),
                 ),
-                ("state_version", models.PositiveBigIntegerField(default=0, verbose_name="状态更新版本")),
                 (
                     "manifest_object_key",
                     models.CharField(blank=True, default="", max_length=1024, verbose_name="有效清单对象键"),
@@ -144,7 +140,6 @@ class Migration(migrations.Migration):
                             ("PLANNING", "规划中"),
                             ("READY", "已完整持久化"),
                             ("FAILED", "规划失败"),
-                            ("SUPERSEDED", "已替换"),
                         ],
                         default="PLANNING",
                         max_length=16,
@@ -219,7 +214,6 @@ class Migration(migrations.Migration):
                     "compressed_bytes",
                     models.PositiveBigIntegerField(blank=True, null=True, verbose_name="成功产物压缩字节数"),
                 ),
-                ("processed_rows", models.PositiveBigIntegerField(default=0, verbose_name="本次尝试已写行数，可回退")),
                 (
                     "status",
                     models.CharField(
@@ -254,7 +248,6 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 ("attempts", models.PositiveIntegerField(default=0, verbose_name="累计执行次数")),
-                ("dispatch_generation", models.PositiveBigIntegerField(default=0, verbose_name="投递代次")),
                 ("task_id", models.CharField(blank=True, default="", max_length=255, verbose_name="Celery任务ID")),
                 (
                     "lease_id",
@@ -263,13 +256,11 @@ class Migration(migrations.Migration):
                 ("lease_until", models.DateTimeField(blank=True, null=True, verbose_name="租约到期时间")),
                 ("heartbeat_at", models.DateTimeField(blank=True, null=True, verbose_name="执行心跳")),
                 ("next_retry_at", models.DateTimeField(blank=True, null=True, verbose_name="下次允许尝试时间")),
-                ("worker_id", models.CharField(blank=True, default="", max_length=255, verbose_name="执行进程标识")),
                 (
                     "object_key",
                     models.CharField(blank=True, default="", max_length=1024, verbose_name="获胜产物对象键"),
                 ),
                 ("checksum", models.CharField(blank=True, default="", max_length=64, verbose_name="获胜产物SHA256")),
-                ("published_at", models.DateTimeField(blank=True, null=True, verbose_name="消息发布时间")),
                 ("started_at", models.DateTimeField(blank=True, null=True, verbose_name="本次执行开始时间")),
                 ("finished_at", models.DateTimeField(blank=True, null=True, verbose_name="本次执行完成时间")),
                 ("error_code", models.CharField(blank=True, default="", max_length=64, verbose_name="错误分类")),

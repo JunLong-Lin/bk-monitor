@@ -77,13 +77,12 @@ def job_detail(job_id):
     job = ExportJob.objects.get(pk=job_id)
     parts = list(
         ExportPart.objects.filter(plan__job=job, plan__plan_version=job.current_plan_version, is_leaf=True).values(
-            "status", "stage", "actual_rows", "processed_rows"
+            "status", "stage", "actual_rows"
         )
     )
     completed = sum(part["status"] == ExportPart.Status.SUCCESS for part in parts)
     actual = sum(part["actual_rows"] or 0 for part in parts if part["status"] == ExportPart.Status.SUCCESS)
     active = [part for part in parts if part["status"] in INFLIGHT]
-    processed = actual + sum(part["processed_rows"] for part in active)
     success = job.status == ExportJob.Status.SUCCESS
     expired = success and job.expires_at is not None and job.expires_at <= timezone.now()
     stage = ""
@@ -103,7 +102,6 @@ def job_detail(job_id):
         "stage": stage,
         "estimated_total": job.estimated_total,
         "actual_total": actual,
-        "processed_rows": processed,
         "parts_total": len(parts),
         "parts_completed": completed,
         "percent": 100 if success else min(99, completed * 100 // len(parts)) if parts else 0,
@@ -118,7 +116,6 @@ def job_detail(job_id):
         "created_at": job.created_at,
         "completed_at": job.completed_at,
         "expires_at": job.expires_at,
-        "state_version": job.state_version,
         "can_view": True,
         "can_operate": job.created_by == get_request_username(default="") and job.status not in TERMINAL,
         "poll_after": None if job.status in TERMINAL else 3,

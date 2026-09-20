@@ -1,4 +1,4 @@
-"""公平投递、失败即关闭的 Redis 预算、可重放的消息发布与故障恢复。"""
+"""公平投递、失败即关闭的 Redis 预算与故障恢复。"""
 
 import hashlib
 import json
@@ -25,10 +25,6 @@ class BudgetUnavailable(Exception):
     """Redis 状态无法安全授权任何新工作。"""
 
 
-class PublishNotSent(Exception):
-    """发布方保证消息未提交；其他异常都视为结果不确定。"""
-
-
 @dataclass(frozen=True)
 class Limits:
     global_limit: int
@@ -47,10 +43,10 @@ class Limits:
 
 
 def dimensions(job, oversized):
-    # 不能用场景虚拟索引 0、别名，也不能只取联合查询的第一个资源。
-    resources = job.resolved_resource_ids
-    if not isinstance(resources, list) or not resources or any(not isinstance(r, str) or not r for r in resources):
-        raise BudgetUnavailable("complete canonical resource IDs are required")
+    # 单索引下资源维度由索引集推导；联合/场景实现时再扩展完整资源集合。
+    resources = [f"index:{index_id}" for index_id in job.index_set_ids]
+    if not resources:
+        raise BudgetUnavailable("index set ids are required")
     values = ["global", f"job:{job.pk}"]
     values.extend(f"index:{hashlib.sha256(r.encode()).hexdigest()}" for r in sorted(set(resources)))
     if oversized:
@@ -61,7 +57,6 @@ def dimensions(job, oversized):
 def credential(part):
     return {
         "owner": part.lease_id,
-        "generation": str(part.dispatch_generation),
         "expiry": part.lease_until.timestamp() if part.lease_until else 0,
         "dimensions": dimensions(part.plan.job, part.oversized),
     }
@@ -79,24 +74,19 @@ class RedisBudget:
             result = self.client.eval(self.script, 1, self.key, *args)
         except Exception as exc:
             raise BudgetUnavailable("Redis export budget is unavailable") from exc
-        if result == -1:
-            raise BudgetUnavailable("Redis export ledger must be reconciled")
         return result == 1
 
     def rebuild(self, parts):
-        epoch = uuid4().hex
         entries = {str(part.pk): credential(part) for part in parts}
-        self.execute("rebuild", epoch, json.dumps(entries))
-        return epoch
+        self.execute("rebuild", json.dumps(entries))
 
-    def current_epoch(self):
+    def exists(self):
         try:
-            epoch = self.client.hget(self.key, "_epoch")
+            return self.client.exists(self.key) == 1
         except Exception as exc:
             raise BudgetUnavailable("Redis export budget is unavailable") from exc
-        return epoch.decode() if isinstance(epoch, bytes) else epoch
 
-    def acquire(self, part, epoch, limits):
+    def acquire(self, part, limits):
         entry = credential(part)
         capacities = {key: limits.index_limit for key in entry["dimensions"]}
         capacities.update(
@@ -106,15 +96,13 @@ class RedisBudget:
                 "oversized": limits.oversized_limit,
             }
         )
-        return self.execute("acquire", str(part.pk), epoch, json.dumps(entry), json.dumps(capacities))
+        return self.execute("acquire", str(part.pk), json.dumps(entry), json.dumps(capacities))
 
-    def release(self, part_id, generation, owner):
-        return self.execute("release", str(part_id), owner, str(generation))
+    def release(self, part_id, owner):
+        return self.execute("release", str(part_id), owner)
 
-    def renew(self, part_id, generation, owner, until):
-        return self.execute(
-            "renew", str(part_id), owner, str(generation), timezone.now().timestamp(), until.timestamp()
-        )
+    def renew(self, part_id, owner, until):
+        return self.execute("renew", str(part_id), owner, timezone.now().timestamp(), until.timestamp())
 
 
 class Coordinator:
@@ -137,33 +125,32 @@ class Coordinator:
     def reconcile(self):
         """重建预算时保留过期租约与终态 Job 的在途 I/O。"""
         with self.gate():
-            return self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
+            self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
 
     def reserve(self):
         if self.limits.global_limit <= 0 or self.limits.lease_seconds <= 0:
             return None
         with self.gate() as gate:
-            # 同一轮协调复用账本；Redis 丢失时在数据库锁内恢复。
-            epoch = self.budget.current_epoch()
-            if epoch is None:
-                epoch = self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
+            # Redis 重启后账本丢失，在数据库锁内恢复；正常周期由 recover_expired 重建。
+            if not self.budget.exists():
+                self.budget.rebuild(ExportPart.objects.filter(status__in=INFLIGHT).select_related("plan__job"))
             jobs = ExportJob.objects.filter(status__in=[ExportJob.Status.READY, ExportJob.Status.RUNNING])
             limit = settings.ASYNC_EXPORT_SCAN_LIMIT
             # aging：长时间没有获得投递的 Job 插队优先，再回到持久化 RR 轮转。
             for job_id in self._aged_job_ids(jobs, limit):
-                dispatched = self._dispatch_from_job(job_id, epoch)
+                dispatched = self._dispatch_from_job(job_id)
                 if dispatched is not None:
                     return dispatched
             identifiers = self._round_robin_ids(jobs, gate.cursor, limit)
             for job_id in identifiers:
                 gate.cursor = job_id
                 gate.save(update_fields=["cursor"])
-                dispatched = self._dispatch_from_job(job_id, epoch)
+                dispatched = self._dispatch_from_job(job_id)
                 if dispatched is not None:
                     return dispatched
         return None
 
-    def _dispatch_from_job(self, job_id, epoch):
+    def _dispatch_from_job(self, job_id):
         job = ExportJob.objects.select_for_update().get(pk=job_id)
         if job.status not in {ExportJob.Status.READY, ExportJob.Status.RUNNING}:
             return None
@@ -181,9 +168,8 @@ class Coordinator:
         for part in candidates:
             part.plan.job = job
             part.lease_id, part.task_id = uuid4().hex, uuid4().hex
-            part.dispatch_generation += 1
             part.lease_until = timezone.now() + timedelta(seconds=self.limits.lease_seconds)
-            if not self.budget.acquire(part, epoch, self.limits):
+            if not self.budget.acquire(part, self.limits):
                 continue
             return state.dispatch_part(
                 part.pk, lease_id=part.lease_id, task_id=part.task_id, lease_until=part.lease_until
@@ -212,29 +198,21 @@ class Coordinator:
 
     def deliver(self, part):
         try:
-            current = state.replay_dispatched_part(part.pk, generation=part.dispatch_generation, lease_id=part.lease_id)
-        except state.ExportStateError:
-            return "stale"
-        try:
-            self.publish(current)
-        except PublishNotSent:
-            # 在数据库锁内确认 Worker 尚未领取，再撤销投递。
-            with self.gate():
-                try:
-                    state.release_dispatch(part.pk, generation=part.dispatch_generation, lease_id=part.lease_id)
-                except state.ExportStateError:
-                    return "claimed"
-            # 数据库提交成功后才能释放额度；否则事务回滚会造成 Redis 少计。
-            self.budget.release(part.pk, part.dispatch_generation, part.lease_id)
-            return "not_sent"
+            self.publish(part)
         except Exception:
-            # broker 超时/断连不能证明消息未投递。
-            return "uncertain"
-        try:
-            state.mark_part_published(part.pk, generation=part.dispatch_generation)
-        except state.ExportStateError:
-            pass  # Worker 可能已经失败或重试了这一代。
+            # 无论明确未发送还是结果不确定，都回滚投递并释放额度；
+            # 若消息其实已投出，Worker 会因凭据(lease_id)不匹配而忽略，超时回收兜底。
+            return self._rollback(part)
         return "published"
+
+    def _rollback(self, part):
+        with self.gate():
+            try:
+                state.release_dispatch(part.pk, lease_id=part.lease_id)
+            except state.ExportStateError:
+                return "claimed"  # Worker 已领取，保留其额度。
+        self.budget.release(part.pk, part.lease_id)
+        return "not_sent"
 
     def tick(self, max_dispatches=100, *, reconcile=True):
         if reconcile:
@@ -246,7 +224,7 @@ class Coordinator:
                 break
             outcome = self.deliver(part)
             sent.append((part.pk, outcome))
-            if outcome in {"uncertain", "not_sent"}:
+            if outcome == "not_sent":
                 break  # 避免 broker 不可用时空转。
         return sent
 
@@ -271,16 +249,6 @@ class Coordinator:
                 cursor.save(update_fields=["cursor"])
             records = {record.pk: record for record in queryset.filter(pk__in=identifiers)}
         return [records[pk] for pk in identifiers if pk in records]
-
-    def replay(self, limit=100, *, reconcile=True):
-        if reconcile:
-            self.reconcile()
-        parts = self._batch(
-            ExportPart.objects.filter(status=ExportPart.Status.DISPATCHED, lease_until__gt=timezone.now()),
-            "replay",
-            limit,
-        )
-        return [(part.pk, self.deliver(part)) for part in parts]
 
     def recover_expired(self, limit=100):
         """只回收未被领取的过期投递；运行中的 I/O 保留其预留。"""
@@ -362,10 +330,8 @@ class Coordinator:
                 yield "finalize", job_id
 
 
-def renew_worker_lease(budget, part_id, *, generation, lease_id, lease_until, processed_rows=None):
+def renew_worker_lease(budget, part_id, *, lease_id, lease_until):
     """Redis 失败即拒绝新的数据库心跳；绝不复活已失去所有权的 Worker。"""
-    if not budget.renew(part_id, generation, lease_id, lease_until):
+    if not budget.renew(part_id, lease_id, lease_until):
         raise BudgetUnavailable("worker budget ownership was lost")
-    return state.heartbeat_part(
-        part_id, generation=generation, lease_id=lease_id, lease_until=lease_until, processed_rows=processed_rows
-    )
+    return state.heartbeat_part(part_id, lease_id=lease_id, lease_until=lease_until)

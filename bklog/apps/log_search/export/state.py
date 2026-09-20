@@ -63,19 +63,14 @@ def _ensure_current_part(part, plan, job):
         raise StaleExportUpdateError(f"Part {part.pk} is not a current active leaf")
 
 
-def _ensure_worker_credential(part, generation, lease_id, statuses):
-    """只校验当前投递代次与所有者，不校验租约是否过期。"""
-    if (
-        part.status not in statuses
-        or part.dispatch_generation != generation
-        or not lease_id
-        or part.lease_id != lease_id
-    ):
+def _ensure_worker_credential(part, lease_id, statuses):
+    """只校验当前所有者，不校验租约是否过期。"""
+    if part.status not in statuses or not lease_id or part.lease_id != lease_id:
         raise StaleExportUpdateError(f"Part {part.pk}: stale worker credential")
 
 
-def _ensure_live_worker(part, generation, lease_id, statuses):
-    _ensure_worker_credential(part, generation, lease_id, statuses)
+def _ensure_live_worker(part, lease_id, statuses):
+    _ensure_worker_credential(part, lease_id, statuses)
     if part.lease_until is None or part.lease_until <= _now():
         raise StaleExportUpdateError(f"Part {part.pk}: lease expired")
 
@@ -128,7 +123,7 @@ def begin_planning(job_id):
     with transaction.atomic():
         job = ExportJob.objects.select_for_update().get(pk=job_id)
         _ensure_job_transition(job, ExportJob.Status.PLANNING)
-        return _save(job, status=ExportJob.Status.PLANNING, state_version=job.state_version + 1)
+        return _save(job, status=ExportJob.Status.PLANNING)
 
 
 @dataclass(frozen=True)
@@ -210,7 +205,7 @@ def claim_planning(*, job_id: int | None = None, part_id: int | None = None) -> 
         if record.next_planning_at and record.next_planning_at > now:
             return None
         if job.status == ExportJob.Status.PENDING:
-            _save(job, status=ExportJob.Status.PLANNING, state_version=job.state_version + 1)
+            _save(job, status=ExportJob.Status.PLANNING)
         started = record.planning_started_at or now
         deadline = started + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_DEADLINE)
         if now >= deadline or record.planning_attempts >= settings.ASYNC_EXPORT_PLANNING_ATTEMPTS:
@@ -285,9 +280,6 @@ def persist_plan(
             part_count=len(specs),
         )
         ExportPart.objects.bulk_create(_part_rows(plan, specs))
-        ExportPlan.objects.filter(job=job, status=ExportPlan.Status.READY).exclude(pk=plan.pk).update(
-            status=ExportPlan.Status.SUPERSEDED, updated_at=_now()
-        )
         _save(
             job,
             current_plan_version=plan_version,
@@ -297,7 +289,6 @@ def persist_plan(
             next_planning_at=None,
             error_code="",
             error_detail="",
-            state_version=job.state_version + 1,
         )
         return plan
 
@@ -323,11 +314,9 @@ def dispatch_part(part_id, *, lease_id, task_id, lease_until):
         _save(
             part,
             status=ExportPart.Status.DISPATCHED,
-            dispatch_generation=part.dispatch_generation + 1,
             task_id=task_id,
             lease_id=lease_id,
             lease_until=lease_until,
-            published_at=None,
             started_at=None,
             finished_at=None,
             heartbeat_at=None,
@@ -341,7 +330,6 @@ def dispatch_part(part_id, *, lease_id, task_id, lease_until):
                 status=ExportJob.Status.RUNNING,
                 started_at=now,
                 last_dispatched_at=now,
-                state_version=job.state_version + 1,
             )
         else:
             # 公平调度（aging）依赖最近一次投递时间，RUNNING 状态下每次授权
@@ -350,58 +338,29 @@ def dispatch_part(part_id, *, lease_id, task_id, lease_until):
         return part
 
 
-def mark_part_published(part_id, *, generation, published_at=None):
-    with transaction.atomic():
-        part, _, _ = _get_locked_part(part_id)
-        if (
-            part.status
-            not in {
-                ExportPart.Status.DISPATCHED,
-                ExportPart.Status.RUNNING,
-                ExportPart.Status.UPLOADING,
-                ExportPart.Status.SUCCESS,
-            }
-            or part.dispatch_generation != generation
-        ):
-            raise StaleExportUpdateError("stale publish acknowledgement")
-        return part if part.published_at else _save(part, published_at=published_at or _now())
-
-
-def release_dispatch(part_id, *, generation, lease_id, error_code="DISPATCH_FAILED", error_detail=""):
+def release_dispatch(part_id, *, lease_id, error_code="DISPATCH_FAILED", error_detail=""):
     """仅在确认发布失败，或未被领取的租约已过期时使用。"""
     with transaction.atomic():
         part, _, _ = _get_locked_part(part_id)
-        _ensure_worker_credential(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
+        _ensure_worker_credential(part, lease_id, {ExportPart.Status.DISPATCHED})
         return _save(
             part,
             status=ExportPart.Status.WAITING,
             stage="",
             lease_id="",
             lease_until=None,
-            published_at=None,
             error_code=error_code,
             error_detail=error_detail,
             next_retry_at=None,
         )
 
 
-def replay_dispatched_part(part_id, *, generation, lease_id):
+def claim_part(part_id, *, lease_id):
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
-        return part
-
-
-def claim_part(part_id, *, generation, lease_id, worker_id):
-    if not worker_id:
-        raise ExportStateError("worker_id is required")
-    with transaction.atomic():
-        part, plan, job = _get_locked_part(part_id)
-        _ensure_current_part(part, plan, job)
-        _ensure_running_job(job)
-        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.DISPATCHED})
+        _ensure_live_worker(part, lease_id, {ExportPart.Status.DISPATCHED})
         if part.attempts >= settings.ASYNC_EXPORT_MAX_ATTEMPTS:
             raise RetryLimitExceededError("Part execution-attempt budget exhausted")
         now = _now()
@@ -409,54 +368,47 @@ def claim_part(part_id, *, generation, lease_id, worker_id):
             part,
             status=ExportPart.Status.RUNNING,
             stage=ExportJob.Stage.DOWNLOAD_LOG,
-            worker_id=worker_id,
             attempts=part.attempts + 1,
             started_at=now,
             heartbeat_at=now,
-            processed_rows=0,
         )
 
 
-def heartbeat_part(part_id, *, generation, lease_id, lease_until, processed_rows=None):
+def heartbeat_part(part_id, *, lease_id, lease_until):
     """终态 Job 会保留所有权，直到已开始的 I/O 退出为止。"""
-    if processed_rows is not None and (type(processed_rows) is not int or processed_rows < 0):
-        raise ExportStateError("processed_rows must be a nonnegative integer")
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
-        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
+        _ensure_live_worker(part, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
         if lease_until <= _now() or lease_until < part.lease_until:
             raise ExportStateError("heartbeat must not shorten or expire the lease")
-        changes = dict(lease_until=lease_until, heartbeat_at=_now())
-        if processed_rows is not None:
-            changes["processed_rows"] = processed_rows
-        return _save(part, **changes)
+        return _save(part, lease_until=lease_until, heartbeat_at=_now())
 
 
-def begin_part_package(part_id, *, generation, lease_id):
+def begin_part_package(part_id, *, lease_id):
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.RUNNING})
+        _ensure_live_worker(part, lease_id, {ExportPart.Status.RUNNING})
         return _save(part, stage=ExportJob.Stage.PACKAGE, heartbeat_at=_now())
 
 
-def begin_part_upload(part_id, *, generation, lease_id):
+def begin_part_upload(part_id, *, lease_id):
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.RUNNING})
+        _ensure_live_worker(part, lease_id, {ExportPart.Status.RUNNING})
         return _save(part, status=ExportPart.Status.UPLOADING, stage=ExportJob.Stage.UPLOAD, heartbeat_at=_now())
 
 
-def retry_part(part_id, *, generation, lease_id, error_code, error_detail, next_retry_at=None):
+def retry_part(part_id, *, lease_id, error_code, error_detail, next_retry_at=None):
     """记录已安全结束的 I/O；仅凭 TTL 到期不能作为退出的证据。"""
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
-        _ensure_worker_credential(part, generation, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
+        _ensure_worker_credential(part, lease_id, {ExportPart.Status.RUNNING, ExportPart.Status.UPLOADING})
         if job.status in {ExportJob.Status.CANCELED, ExportJob.Status.FAILED}:
             target = ExportPart.Status.CANCELED
         else:
@@ -485,7 +437,6 @@ def retry_part(part_id, *, generation, lease_id, error_code, error_detail, next_
 def complete_part(
     part_id,
     *,
-    generation,
     lease_id,
     actual_rows,
     actual_bytes,
@@ -503,7 +454,7 @@ def complete_part(
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
-        _ensure_live_worker(part, generation, lease_id, {ExportPart.Status.UPLOADING})
+        _ensure_live_worker(part, lease_id, {ExportPart.Status.UPLOADING})
         _save(
             part,
             status=ExportPart.Status.SUCCESS,
@@ -511,7 +462,6 @@ def complete_part(
             actual_rows=actual_rows,
             actual_bytes=actual_bytes,
             compressed_bytes=compressed_bytes,
-            processed_rows=actual_rows,
             object_key=object_key,
             checksum=checksum,
             lease_id="",
@@ -577,7 +527,6 @@ def split_part(
         )
         ExportPart.objects.bulk_create(rows)
         _save(plan, part_count=count)
-        _save(job, state_version=job.state_version + 1)
         # MySQL 的 bulk_create 不会回填自增主键，因此重新读取子分片，
         # 不能依赖内存中的实例。
         return list(ExportPart.objects.filter(plan=plan, parent=part).order_by("part_no"))
@@ -610,7 +559,6 @@ def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_
             next_finalization_at=None,
             completed_at=now,
             expires_at=now + timedelta(seconds=settings.ASYNC_EXPORT_ARTIFACT_RETENTION_SECONDS),
-            state_version=job.state_version + 1,
         )
 
 
@@ -625,7 +573,6 @@ def _finish_job(job, status, *, error_code="", error_detail=""):
         completed_at=now,
         planning_lease_until=None,
         next_planning_at=None,
-        state_version=job.state_version + 1,
     )
     ExportPart.objects.filter(
         plan__job=job, status__in=[ExportPart.Status.WAITING, ExportPart.Status.DISPATCHED]
@@ -659,17 +606,12 @@ def recover_expired_part(candidate):
     """回收未被任何 Worker 领取的过期投递。"""
     with transaction.atomic():
         part, _, _ = _get_locked_part(candidate.pk)
-        fields = ("status", "dispatch_generation", "lease_id", "lease_until")
+        fields = ("status", "lease_id", "lease_until")
         if any(getattr(part, field) != getattr(candidate, field) for field in fields):
             return False
         if part.status != ExportPart.Status.DISPATCHED:
             return False
-        release_dispatch(
-            part.pk,
-            generation=part.dispatch_generation,
-            lease_id=part.lease_id,
-            error_code="DISPATCH_LEASE_EXPIRED",
-        )
+        release_dispatch(part.pk, lease_id=part.lease_id, error_code="DISPATCH_LEASE_EXPIRED")
         return True
 
 
@@ -699,4 +641,4 @@ def set_parallelism(job_id, parallelism):
             raise InvalidTransitionError("cannot change terminal Job parallelism")
         if job.requested_parallelism == parallelism:
             return job
-        return _save(job, requested_parallelism=parallelism, state_version=job.state_version + 1)
+        return _save(job, requested_parallelism=parallelism)

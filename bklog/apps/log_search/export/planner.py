@@ -141,7 +141,7 @@ def _run_planning(attempt: state.PlanningAttempt | None, statistics_factory: Sta
     if attempt is None:
         return None
     try:
-        policy = PlannerPolicy.for_job(attempt.job)
+        policy = PlannerPolicy.configured()
         # 工厂负责租户/用户上下文，成功、失败、取消以及规划回调已过期时
         # 都必须恢复现场。
         attempt.heartbeat()

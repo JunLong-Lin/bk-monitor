@@ -39,13 +39,11 @@ class UnifyQueryStatistics:
         if job.query_kind not in settings.ASYNC_EXPORT_VERIFIED_QUERY_KINDS:
             raise PlanningError("QUERY_PROTOCOL_NOT_VERIFIED")
         self.base = deepcopy(job.query_snapshot["unify_query"])
-        if not self.base.get("query_list") or not job.resolved_resource_ids:
+        if not self.base.get("query_list"):
             raise PlanningError("INCOMPLETE_ROUTING_SNAPSHOT")
-        if self.base["query_list"] != job.routing_snapshot.get("query_list"):
-            raise PlanningError("ROUTING_SNAPSHOT_MISMATCH")
         self.tick = job.time_tick
         self.units = job.query_snapshot["time_units_per_second"]
-        self.end_mode = job.policy_snapshot.get("query_end_mode")
+        self.end_mode = settings.ASYNC_EXPORT_QUERY_END_MODES.get(job.query_kind)
         if self.end_mode not in {"exclusive", "inclusive"}:
             raise PlanningError("QUERY_BOUNDARY_NOT_VERIFIED")
         self.raw, self.reference, self.project = raw, reference, project

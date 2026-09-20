@@ -13,7 +13,7 @@ def create_job(**extra):
         start_time=0,
         end_time=60,
         time_tick=1,
-        resolved_resource_ids=["index:1"],
+        index_set_ids=[1],
     )
     values.update(extra)
     return ExportJob.objects.create(**values)

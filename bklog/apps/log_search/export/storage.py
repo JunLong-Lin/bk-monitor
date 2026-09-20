@@ -39,7 +39,7 @@ class ArtifactStore:
     def publish(self, part, artifact, guard):
         key = (
             f"{artifact_prefix(part.plan.job)}{part.plan.plan_version}/{part.pk}/"
-            f"{part.dispatch_generation}/{artifact.checksum}.tar.gz"
+            f"{part.attempts}/{artifact.checksum}.tar.gz"
         )
         return self.publish_file(part.plan.job, key, artifact, guard)
 

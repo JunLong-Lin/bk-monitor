@@ -129,7 +129,6 @@ class PartWorkerTest(TestCase):
 
         run_part(
             self.part.pk,
-            generation=self.part.dispatch_generation,
             lease_id="owner",
             query_factory=factory,
             budget=self.budget,
@@ -166,12 +165,12 @@ class PartWorkerTest(TestCase):
         def open_archive(*args, **kwargs):
             if kwargs.get("mode") == "w|":
                 self.part.refresh_from_db()
-                observed.append((self.part.stage, self.part.processed_rows))
+                observed.append(self.part.stage)
             return original_open(*args, **kwargs)
 
         with patch("apps.log_search.export.worker.tarfile.open", side_effect=open_archive):
             self.execute(query_with_pages([{"list": [{"log": "one"}], "done": True}]))
-        self.assertEqual(observed, [("PACKAGE", 1)])
+        self.assertEqual(observed, ["PACKAGE"])
         self.assertEqual(self.part.status, ExportPart.Status.SUCCESS)
 
     def test_query_timeout_retries_part_without_publishing(self):

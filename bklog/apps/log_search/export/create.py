@@ -12,7 +12,6 @@ from apps.log_search.export import admission
 from apps.log_search.export.adapter import export_identity, projection_snapshot
 from apps.log_search.export.api import ExportConflict, authorized_scope, job_detail
 from apps.log_search.export.contracts import ExportStateError
-from apps.log_search.export.models import ExportJob
 from apps.log_search.handlers.search.search_handlers_esquery import SearchHandler
 from apps.log_search.models import AsyncTask
 from apps.log_unifyquery.handler.base import UnifyQueryHandler
@@ -48,19 +47,7 @@ def create_export(request, data):
         raise ValidationError("QUERY_MODE_NOT_IMPLEMENTED")
     identity = dict(space_uid=space.space_uid, created_by=username)
     source_app = get_request_app_code()
-    request_hash = digest({"input": data, "source_app_code": source_app})
-    # 在 Handler 初始化之前先检查（初始化可能远程解析元数据）；
-    # 快照构造完成后会在同一把锁内复检最终准入。
     with admission.admission_lock(username):
-        if data["request_id"]:
-            existing = ExportJob.objects.filter(**identity, request_id=data["request_id"]).first()
-            if existing:
-                if (
-                    existing.source_app_code != source_app
-                    or existing.query_snapshot.get("request_hash") != request_hash
-                ):
-                    raise ExportConflict("EXPORT_REQUEST_ID_CONFLICT")
-                return job_detail(existing.pk)
         AsyncTask.check_running_count_by_user(username)
 
     params = {
@@ -97,12 +84,10 @@ def create_export(request, data):
         "unify_query": base,
         "time_units_per_second": 1000,
         "projection": projection,
-        "request_hash": request_hash,
     }
     values = dict(
         **identity,
         source_app_code=source_app,
-        request_id=data["request_id"],
         query_kind="single",
         index_set_ids=[index.pk],
         query_snapshot=query_snapshot,
@@ -111,7 +96,7 @@ def create_export(request, data):
         time_tick=tick,
         requested_parallelism=data["requested_parallelism"],
     )
-    values["query_hash"] = digest({key: value for key, value in values.items() if key != "request_id"})
+    values["query_hash"] = digest(values)
     try:
         job = admission.create_job(**values)
     except ExportStateError as error:

@@ -36,10 +36,6 @@ class Migration(migrations.Migration):
                 ("created_by", models.CharField(max_length=64, verbose_name="创建者")),
                 ("source_app_code", models.CharField(blank=True, default="", max_length=32, verbose_name="来源应用")),
                 (
-                    "request_id",
-                    models.CharField(blank=True, default=None, max_length=128, null=True, verbose_name="幂等请求标识"),
-                ),
-                (
                     "query_kind",
                     models.CharField(
                         choices=[("single", "单索引"), ("union", "联合查询"), ("scene", "场景检索")],
@@ -118,7 +114,6 @@ class Migration(migrations.Migration):
             ],
             options={
                 "db_table": "log_export_job",
-                "unique_together": {("space_uid", "created_by", "request_id")},
             },
         ),
         migrations.CreateModel(

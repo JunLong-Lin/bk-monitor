@@ -9,7 +9,6 @@ from rest_framework.test import APIRequestFactory
 from apps.log_search.constants import ExportType
 from apps.log_search.exceptions import ConcurrentExportLimitException
 from apps.log_search.export.adapter import native_query_factory
-from apps.log_search.export.api import ExportConflict
 from apps.log_search.export.contracts import PlanningError
 from apps.log_search.export.create import create_export
 from apps.log_search.export.models import ExportJob
@@ -25,7 +24,6 @@ def inputs(**extra):
         data={
             "space_uid": "bkcc__2",
             "index_set_id": 1,
-            "request_id": "request-1",
             "start_time": 1700000000000,
             "end_time": 1700000060000,
             **extra,
@@ -181,22 +179,6 @@ class CreateExportTest(TestCase):
         self.assertEqual((job.time_tick, job.query_snapshot["time_units_per_second"]), (1, 1000))
         self.last_handler.pre_get_result.assert_not_called()
         self.last_handler.query_ts_raw.assert_not_called()
-
-    def test_repeated_request_at_capacity_reuses_frozen_job_without_rebuilding(self):
-        first = create_export(None, inputs())
-        for _ in range(2):
-            AsyncTask.objects.create(created_by="alice", export_type=ExportType.ASYNC, request_param={})
-        builder = self.mocks["apps.log_search.export.create.UnifyQueryHandler"]
-        builder.reset_mock()
-        with override_settings(ASYNC_EXPORT_PLANNER_POLICY={"max_rows": 1}):
-            repeated = create_export(None, inputs())
-        self.assertEqual(first["job_id"], repeated["job_id"])
-        builder.assert_not_called()
-        with self.assertRaises(ExportConflict):
-            create_export(None, inputs(keyword="different"))
-        self.mocks["apps.log_search.export.create.get_request_app_code"].return_value = "other"
-        with self.assertRaises(ExportConflict):
-            create_export(None, inputs())
 
     def test_capacity_rejected_before_query_binding(self):
         for _ in range(3):

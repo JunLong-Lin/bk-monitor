@@ -35,7 +35,6 @@ class ExportStateTest(TestCase):
             space_uid="space-a",
             created_by="alice",
             source_app_code="bk_log_search",
-            request_id="request-1",
             query_kind=ExportJob.QueryKind.SINGLE,
             index_set_ids=[1],
             query_snapshot={"time_field": "dtEventTimeStamp"},

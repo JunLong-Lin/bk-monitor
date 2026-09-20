@@ -17,7 +17,6 @@ class ExportAdditionSerializer(serializers.Serializer):
 class ExportCreateSerializer(serializers.Serializer):
     space_uid = serializers.CharField(max_length=256)
     index_set_id = serializers.IntegerField(min_value=1)
-    request_id = serializers.CharField(max_length=128, required=False, default=None)
     start_time = serializers.IntegerField(min_value=0)
     end_time = serializers.IntegerField(min_value=1)
     keyword = serializers.CharField(default="*", allow_blank=True)

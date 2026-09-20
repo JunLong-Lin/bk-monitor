@@ -361,25 +361,6 @@ class AdmissionTest(TestCase):
         values["query_kind"] = "scene"
         self.assertEqual(admit(**values).status, ExportJob.Status.PENDING)
 
-    def test_same_request_is_idempotent_even_at_capacity(self):
-        from apps.log_search.export.admission import create_job as admit
-
-        values = dict(
-            space_uid="space",
-            created_by="alice",
-            query_kind="single",
-            query_hash="a" * 64,
-            query_snapshot={"time_units_per_second": 1},
-            request_id="same",
-            start_time=0,
-            end_time=10,
-            time_tick=1,
-        )
-        first = admit(**values)
-        create_job()
-        create_job()
-        self.assertEqual(admit(**values).pk, first.pk)
-
 
 class ControlTasksTest(TestCase):
     @override_settings(ASYNC_EXPORT_CONTROL_ENABLED=False)

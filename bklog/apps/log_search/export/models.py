@@ -58,7 +58,6 @@ class ExportJob(PlanningRecord):
     space_uid = models.CharField(_("空间标识"), max_length=256)
     created_by = models.CharField(_("创建者"), max_length=64)
     source_app_code = models.CharField(_("来源应用"), max_length=32, blank=True, default="")
-    request_id = models.CharField(_("幂等请求标识"), max_length=128, null=True, blank=True, default=None)
     query_kind = models.CharField(_("查询类型"), max_length=16, choices=QueryKind.choices)
     index_set_ids = models.JSONField(_("原始索引集ID"), default=list, blank=True)
     query_snapshot = models.JSONField(_("规范化查询快照"))
@@ -91,7 +90,6 @@ class ExportJob(PlanningRecord):
 
     class Meta:
         db_table = "log_export_job"
-        unique_together = (("space_uid", "created_by", "request_id"),)
         indexes = [
             models.Index(fields=["created_by", "status", "created_at"], name="export_job_user_status"),
             models.Index(fields=["space_uid", "created_at", "id"], name="export_job_space_history"),

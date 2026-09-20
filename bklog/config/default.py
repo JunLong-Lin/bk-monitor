@@ -168,12 +168,7 @@ MIDDLEWARE = (
 
 # Resource Call owns an explicit, discoverable params schema. Avoid recursively
 # adding space fields to its opaque ``params`` envelope before schema validation.
-# 分片导出创建接口同样使用严格的显式字段校验，空间字段由服务端自行解析，
-# 因此排除注入，避免自动补充的 bk_biz_id 触发 EXPORT_UNKNOWN_FIELDS。
-BKM_SPACE_INJECT_REQUEST_EXCLUDED_PATHS = (
-    "/api/v1/admin/resource/call/",
-    "/api/v1/search/export_jobs/",
-)
+BKM_SPACE_INJECT_REQUEST_EXCLUDED_PATHS = ("/api/v1/admin/resource/call/",)
 
 # 所有环境的日志级别可以在这里配置
 # LOG_LEVEL = 'INFO'

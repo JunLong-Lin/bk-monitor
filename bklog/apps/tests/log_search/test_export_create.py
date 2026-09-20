@@ -36,23 +36,16 @@ def inputs(**extra):
 
 
 class CreateInputTest(SimpleTestCase):
-    def test_rejects_internal_and_legacy_parameters(self):
-        for key in (
-            "query_snapshot",
-            "policy_snapshot",
-            "created_by",
-            "source_app_code",
-            "bk_biz_id",
-            "query_kind",
-            "is_desensitize",
-            "original_search",
-            "custom_indices",
-            "size",
-            "begin",
-            "time_zone",
-        ):
-            with self.subTest(key=key), self.assertRaises(ValidationError):
-                inputs(**{key: {}})
+    def test_ignores_undeclared_parameters(self):
+        data = inputs(
+            bk_biz_id=2,
+            created_by="someone_else",
+            is_desensitize=False,
+            begin=0,
+            addition=[{"field": "service", "operator": "is", "value": "api", "unused": "ignored"}],
+        )
+        self.assertFalse({"bk_biz_id", "created_by", "is_desensitize", "begin"} & data.keys())
+        self.assertEqual(data["addition"], [{"field": "service", "operator": "is", "value": "api"}])
 
     def test_invalid_ranges_sort_and_fields(self):
         for extra in (

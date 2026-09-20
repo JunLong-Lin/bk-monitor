@@ -3,14 +3,7 @@
 from rest_framework import serializers
 
 
-class StrictSerializer(serializers.Serializer):
-    def to_internal_value(self, data):
-        if isinstance(data, dict) and set(data) - set(self.fields):
-            raise serializers.ValidationError({"non_field_errors": ["EXPORT_UNKNOWN_FIELDS"]})
-        return super().to_internal_value(data)
-
-
-class ExportAdditionSerializer(StrictSerializer):
+class ExportAdditionSerializer(serializers.Serializer):
     field = serializers.CharField()
     operator = serializers.CharField()
     value = serializers.JSONField()
@@ -23,7 +16,7 @@ class ExportAdditionSerializer(StrictSerializer):
         return value
 
 
-class ExportCreateSerializer(StrictSerializer):
+class ExportCreateSerializer(serializers.Serializer):
     space_uid = serializers.CharField(max_length=256)
     index_set_id = serializers.IntegerField(min_value=1)
     request_id = serializers.CharField(max_length=128, required=False, default=None)

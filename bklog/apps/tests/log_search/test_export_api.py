@@ -96,7 +96,6 @@ class ExportAPITest(TestCase):
     def test_parallelism_does_not_claim_to_be_actual_inflight(self):
         detail = operate_job(self.job.pk, parallelism=8)
         self.assertEqual(detail["requested_parallelism"], 8)
-        self.assertEqual(detail["configured_parallelism_limit"], 4)
         self.assertEqual(detail["inflight_parts"], 0)
 
     def test_scope_mismatch_is_not_found_before_iam(self):

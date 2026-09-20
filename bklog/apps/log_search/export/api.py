@@ -107,9 +107,6 @@ def job_detail(job_id):
         "percent": 100 if success else min(99, completed * 100 // len(parts)) if parts else 0,
         "percent_basis": "completed_parts",
         "requested_parallelism": job.requested_parallelism,
-        "configured_parallelism_limit": max(
-            0, min(job.requested_parallelism, settings.ASYNC_EXPORT_INDEX_LIMIT, settings.ASYNC_EXPORT_GLOBAL_LIMIT)
-        ),
         "inflight_parts": len(active),
         "error_code": job.error_code,
         "created_by": job.created_by,

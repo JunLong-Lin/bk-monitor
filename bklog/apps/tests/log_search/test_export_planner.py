@@ -188,7 +188,7 @@ class PlanningStateTest(TestCase):
         self.assertEqual(job.error_code, "PLANNING_TIMEOUT")
 
     @override_settings(ASYNC_EXPORT_MAX_ATTEMPTS=1)
-    def test_split_statistics_failure_has_separate_bounded_attempt_budget(self):
+    def test_split_statistics_failure_backs_off_without_failing_job(self):
         job = create_job()
         plan = plan_job(job.pk, lambda job: Distribution({}))
         part = plan.parts.get()
@@ -197,13 +197,13 @@ class PlanningStateTest(TestCase):
         )
         state.claim_part(part.pk, lease_id="lease")
         state.retry_part(part.pk, lease_id="lease", error_code="OVERSIZED", error_detail="")
-        for _ in range(3):
-            ExportPart.objects.filter(pk=part.pk).update(next_planning_at=None)
-            replan_failed_part(part.pk, Mock(side_effect=TimeoutError))
+        replan_failed_part(part.pk, Mock(side_effect=TimeoutError))
         job.refresh_from_db()
         part.refresh_from_db()
-        self.assertEqual(job.status, "FAILED")
-        self.assertEqual(part.planning_attempts, 3)
+        self.assertEqual(job.status, "RUNNING")
+        self.assertEqual(part.status, "FAILED")
+        self.assertIsNotNone(part.next_retry_at)
+        self.assertEqual(part.error_code, "STATISTICS_FAILED")
         self.assertEqual(part.attempts, 1)
 
     def test_query_factory_always_restores_context(self):
@@ -286,25 +286,19 @@ class PlanningStateTest(TestCase):
             )
         self.assertFalse(job.plans.exists())
 
-    def test_local_planning_uses_the_same_lease_fence_and_overall_deadline(self):
+    def test_split_claim_is_fenced_by_next_retry_at(self):
         job = create_job()
         plan = plan_job(job.pk, lambda current: Distribution({}))
         part = plan.parts.get()
-        # 对局部规划而言，一次已结束的执行就是起始状态。
+        # 一次已结束的 OVERSIZED 执行就是拆分起始状态。
         ExportJob.objects.filter(pk=job.pk).update(status="RUNNING")
         ExportPart.objects.filter(pk=part.pk).update(status="FAILED", attempts=3, error_code="OVERSIZED")
-        first = state.claim_planning(part_id=part.pk)
-        ExportPart.objects.filter(pk=part.pk).update(planning_lease_until=timezone.now() - timedelta(seconds=1))
-        second = state.claim_planning(part_id=part.pk)
-        with self.assertRaises(state.StaleExportUpdateError):
-            first.heartbeat()
-        self.assertEqual(second.generation, 2)
-        ExportPart.objects.filter(pk=part.pk).update(
-            planning_lease_until=None, planning_started_at=timezone.now() - timedelta(hours=1)
-        )
-        self.assertIsNone(state.claim_planning(part_id=part.pk))
-        job.refresh_from_db()
-        self.assertEqual(job.error_code, "PLANNING_TIMEOUT")
+        self.assertIsNotNone(state.begin_split(part.pk))
+        # 进行中的拆分不会被重复认领。
+        self.assertIsNone(state.begin_split(part.pk))
+        # 退避到期后可重新认领。
+        ExportPart.objects.filter(pk=part.pk).update(next_retry_at=timezone.now() - timedelta(seconds=1))
+        self.assertIsNotNone(state.begin_split(part.pk))
 
 
 @override_settings(ASYNC_EXPORT_VERIFIED_QUERY_KINDS=["union"], ASYNC_EXPORT_QUERY_END_MODES={"union": "inclusive"})

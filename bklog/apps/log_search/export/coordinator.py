@@ -283,9 +283,7 @@ class Coordinator:
             plan__job__status=ExportJob.Status.RUNNING,
             plan__plan_version=F("plan__job__current_plan_version"),
         )
-        due_split = (Q(planning_lease_until__isnull=True) | Q(planning_lease_until__lte=now)) & (
-            Q(next_planning_at__isnull=True) | Q(next_planning_at__lte=now)
-        )
+        due_split = Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=now)
         return self._batch(failed.filter(~Q(error_code__in=SPLITTABLE_PART_ERROR_CODES) | due_split), "failed", limit)
 
     def finalizing_jobs(self, limit=100):

@@ -20,7 +20,7 @@ class ExportRecord(models.Model):
 
 
 class PlanningRecord(ExportRecord):
-    """初始规划与局部规划共用的持久化尝试生命周期。"""
+    """初始规划使用的持久化尝试生命周期。"""
 
     planning_attempts = models.PositiveIntegerField(default=0)
     planning_generation = models.PositiveBigIntegerField(default=0)
@@ -127,7 +127,7 @@ class ExportPlan(ExportRecord):
         indexes = []
 
 
-class ExportPart(PlanningRecord):
+class ExportPart(ExportRecord):
     """计划中一个固定的左闭右开时间范围。"""
 
     class Status(models.TextChoices):

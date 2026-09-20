@@ -316,7 +316,7 @@ class CoordinatorTest(TestCase):
         first = plan.parts.get(part_no=1)
         second = plan.parts.get(part_no=2)
         ExportPart.objects.filter(pk=first.pk).update(
-            status="FAILED", error_code="OVERSIZED", planning_lease_until=timezone.now() + timedelta(minutes=1)
+            status="FAILED", error_code="OVERSIZED", next_retry_at=timezone.now() + timedelta(minutes=1)
         )
         ExportPart.objects.filter(pk=second.pk).update(status="FAILED", attempts=3, error_code="QUERY_FAILED")
         self.assertEqual([part.pk for part in self.coordinator.failed_parts(limit=1)], [second.pk])

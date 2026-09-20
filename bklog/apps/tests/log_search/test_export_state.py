@@ -174,7 +174,6 @@ class ExportStateTest(TestCase):
 
         children = split_part(
             part.pk,
-            attempt=claim_planning(part_id=part.pk),
             children=[PartSpec(None, 0, 10), PartSpec(None, 10, 20)],
         )
 
@@ -389,20 +388,19 @@ class ExportStateTest(TestCase):
         self.complete_claimed_part(first, lease, rows=7)
         second, lease = self.dispatch_and_claim(plan.parts.get(part_no=2))
         retry_part(second.pk, lease_id=lease, error_code="OVERSIZED", error_detail="")
-        attempt = claim_planning(part_id=second.pk)
         for children in [
             [PartSpec(None, 10, 15), PartSpec(None, 15, 20)],
             [PartSpec(None, 10, 15, estimated_rows=-1), PartSpec(None, 15, 20)],
         ]:
             with self.subTest(children=children), self.assertRaises(PlanValidationError):
-                split_part(second.pk, attempt=attempt, children=children)
+                split_part(second.pk, children=children)
         second.refresh_from_db()
         plan.refresh_from_db()
         self.assertEqual(second.status, ExportPart.Status.FAILED)
         self.assertTrue(second.is_leaf)
         self.assertEqual(plan.part_count, 2)
         with override_settings(ASYNC_EXPORT_MAX_LEAF_PARTS=3):
-            children = split_part(second.pk, attempt=attempt, children=[PartSpec(None, 10, 15), PartSpec(None, 15, 20)])
+            children = split_part(second.pk, children=[PartSpec(None, 10, 15), PartSpec(None, 15, 20)])
         for child in children:
             claimed, lease = self.dispatch_and_claim(child)
             self.complete_claimed_part(claimed, lease, rows=3)
@@ -465,9 +463,8 @@ class ExportStateTest(TestCase):
         part = self.activate_plan(job).parts.get()
         _, lease = self.dispatch_and_claim(part)
         retry_part(part.pk, lease_id=lease, error_code="OVERSIZED", error_detail="")
-        attempt = claim_planning(part_id=part.pk)
         with self.assertRaises(PlanValidationError):
-            split_part(part.pk, attempt=attempt, children=[PartSpec(None, 0, 5), PartSpec(None, 5, 20)])
+            split_part(part.pk, children=[PartSpec(None, 0, 5), PartSpec(None, 5, 20)])
         part.refresh_from_db()
         self.assertEqual(part.status, "FAILED")
         self.assertFalse(part.children.exists())

@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from apps.log_search.export import state
 from apps.log_search.export.contracts import (
+    InvalidTransitionError,
     PlannerPolicy,
     PlanningError,
     PartSpec,
@@ -15,6 +16,7 @@ from apps.log_search.export.contracts import (
     StaleExportUpdateError,
     nonnegative_integer,
 )
+from apps.log_search.export.models import ExportPart
 from apps.log_search.export.query import Statistics, StatisticsFactory
 from apps.utils.log import logger
 
@@ -137,6 +139,18 @@ class AdaptivePlanner:
         return [replace(part, part_no=i + 1) for i, part in enumerate(parts)], estimate
 
 
+def _classify_planning_error(job, exc):
+    if isinstance(exc, PlanningError):
+        return exc
+    if isinstance(exc, PartLimitExceededError):
+        return PlanningError("PART_LIMIT_EXCEEDED")
+    if isinstance(exc, PlanValidationError):
+        return PlanningError("INVALID_PLAN")
+    # 不落库、不打印异常里的查询内容或凭据。
+    logger.warning("export planning job=%s exception_type=%s", job.pk, type(exc).__name__)
+    return PlanningError("STATISTICS_FAILED", retryable=True)
+
+
 def _run_planning(attempt: state.PlanningAttempt | None, statistics_factory: StatisticsFactory):
     if attempt is None:
         return None
@@ -150,17 +164,7 @@ def _run_planning(attempt: state.PlanningAttempt | None, statistics_factory: Sta
             planner = AdaptivePlanner(
                 attempt.job, statistics, policy, heartbeat=attempt.heartbeat, started_at=started_at
             )
-            target = attempt.part or attempt.job
-            parts, estimate = planner.build(
-                start=target.start_time, end=target.end_time, force_split=attempt.part is not None
-            )
-        if attempt.part is not None:
-            return state.split_part(
-                attempt.part.pk,
-                children=[replace(part, part_no=None) for part in parts],
-                max_leaf_parts=policy.max_parts,
-                attempt=attempt,
-            )
+            parts, estimate = planner.build()
         return state.persist_plan(
             attempt.job.pk,
             query_hash=attempt.job.query_hash,
@@ -177,17 +181,32 @@ def _run_planning(attempt: state.PlanningAttempt | None, statistics_factory: Sta
     except StaleExportUpdateError:
         return None
     except Exception as exc:
-        if isinstance(exc, PlanningError):
-            error = exc
-        elif isinstance(exc, PartLimitExceededError):
-            error = PlanningError("PART_LIMIT_EXCEEDED")
-        elif isinstance(exc, PlanValidationError):
-            error = PlanningError("INVALID_PLAN")
+        attempt.fail(_classify_planning_error(attempt.job, exc))
+        return None
+
+
+def _run_split(part: ExportPart | None, statistics_factory: StatisticsFactory):
+    if part is None:
+        return None
+    try:
+        policy = PlannerPolicy.configured()
+        started_at = time.monotonic()
+        with statistics_factory(part.plan.job) as statistics:
+            planner = AdaptivePlanner(part.plan.job, statistics, policy, started_at=started_at)
+            parts, _ = planner.build(start=part.start_time, end=part.end_time, force_split=True)
+        return state.split_part(
+            part.pk, children=[replace(p, part_no=None) for p in parts], max_leaf_parts=policy.max_parts
+        )
+    except (StaleExportUpdateError, InvalidTransitionError):
+        # 另一个拆分已提交或任务已不再活跃，幂等忽略。
+        return None
+    except Exception as exc:
+        error = _classify_planning_error(part.plan.job, exc)
+        if error.code == "OVERSIZED_UNSPLITTABLE":
+            # 已到时间字段最小精度仍超量，无法继续按时间拆分，Job 明确失败。
+            state.fail_job(part.plan.job.pk, error_code=error.code)
         else:
-            # 不落库、不打印异常里的查询内容或凭据。
-            logger.warning("export planning job=%s exception_type=%s", attempt.job.pk, type(exc).__name__)
-            error = PlanningError("STATISTICS_FAILED", retryable=True)
-        attempt.fail(error)
+            state.fail_split(part.pk, error_code=error.code, error_detail=type(exc).__name__)
         return None
 
 
@@ -196,4 +215,4 @@ def plan_job(job_id: int, statistics_factory: StatisticsFactory):
 
 
 def replan_failed_part(part_id: int, statistics_factory: StatisticsFactory):
-    return _run_planning(state.claim_planning(part_id=part_id), statistics_factory)
+    return _run_split(state.begin_split(part_id), statistics_factory)

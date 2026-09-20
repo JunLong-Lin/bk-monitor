@@ -128,26 +128,18 @@ def begin_planning(job_id):
 
 @dataclass(frozen=True)
 class PlanningAttempt:
-    """初始规划与局部分裂共用的不可变凭据。"""
+    """初始规划使用的不可变凭据。"""
 
     job: ExportJob
     record_id: int
     generation: int
     started_at: datetime
     deadline: datetime
-    part: ExportPart | None = None
 
     def _locked_record(self):
         # 只允许状态操作在 transaction.atomic() 内调用。
-        if self.part is not None:
-            record, plan, job = _get_locked_part(self.record_id)
-            _ensure_current_part(record, plan, job)
-            _ensure_running_job(job)
-            expected = ExportPart.Status.FAILED
-        else:
-            record = job = ExportJob.objects.select_for_update().get(pk=self.record_id)
-            expected = ExportJob.Status.PLANNING
-        if record.status != expected or record.planning_generation != self.generation:
+        record = job = ExportJob.objects.select_for_update().get(pk=self.record_id)
+        if record.status != ExportJob.Status.PLANNING or record.planning_generation != self.generation:
             raise StaleExportUpdateError("planning ownership changed")
         if record.planning_lease_until is None or record.planning_lease_until <= _now():
             raise StaleExportUpdateError("planning lease expired")
@@ -176,29 +168,19 @@ class PlanningAttempt:
             if not error.retryable or record.planning_attempts >= settings.ASYNC_EXPORT_PLANNING_ATTEMPTS:
                 _finish_job(job, ExportJob.Status.FAILED, error_code=error.code)
             else:
-                changes = dict(
+                _save(
+                    record,
                     planning_lease_until=None,
                     next_planning_at=_now() + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_RETRY_SECONDS),
+                    error_code=error.code,
                 )
-                # 保留失败 Part 的执行错误分类，供扫描器判断。
-                if self.part is None:
-                    changes["error_code"] = error.code
-                _save(record, **changes)
 
 
-def claim_planning(*, job_id: int | None = None, part_id: int | None = None) -> PlanningAttempt | None:
-    if (job_id is None) == (part_id is None):
-        raise ExportStateError("specify exactly one planning target")
+def claim_planning(*, job_id: int) -> PlanningAttempt | None:
     with transaction.atomic():
-        if part_id is not None:
-            record, plan, job = _get_locked_part(part_id)
-            if record.status != ExportPart.Status.FAILED or job.status != ExportJob.Status.RUNNING:
-                return None
-            _ensure_current_part(record, plan, job)
-        else:
-            record = job = ExportJob.objects.select_for_update().get(pk=job_id)
-            if job.status not in {ExportJob.Status.PENDING, ExportJob.Status.PLANNING}:
-                return None
+        record = job = ExportJob.objects.select_for_update().get(pk=job_id)
+        if job.status not in {ExportJob.Status.PENDING, ExportJob.Status.PLANNING}:
+            return None
         now = _now()  # 取得锁之后再取时间，不能在等待锁之前取。
         if record.planning_lease_until and record.planning_lease_until > now:
             return None
@@ -209,11 +191,7 @@ def claim_planning(*, job_id: int | None = None, part_id: int | None = None) -> 
         started = record.planning_started_at or now
         deadline = started + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_DEADLINE)
         if now >= deadline or record.planning_attempts >= settings.ASYNC_EXPORT_PLANNING_ATTEMPTS:
-            code = (
-                "PLANNING_TIMEOUT"
-                if now >= deadline
-                else ("SPLIT_RETRIES_EXHAUSTED" if part_id else "PLANNING_RETRIES_EXHAUSTED")
-            )
+            code = "PLANNING_TIMEOUT" if now >= deadline else "PLANNING_RETRIES_EXHAUSTED"
             _finish_job(job, ExportJob.Status.FAILED, error_code=code)
             return None
         _save(
@@ -224,9 +202,7 @@ def claim_planning(*, job_id: int | None = None, part_id: int | None = None) -> 
             next_planning_at=None,
             planning_lease_until=min(deadline, now + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_LEASE_SECONDS)),
         )
-        return PlanningAttempt(
-            job, record.pk, record.planning_generation, started, deadline, record if part_id else None
-        )
+        return PlanningAttempt(job, record.pk, record.planning_generation, started, deadline)
 
 
 def persist_plan(
@@ -252,7 +228,7 @@ def persist_plan(
         raise PlanValidationError("estimated_total must be a nonnegative integer")
     with transaction.atomic():
         job = ExportJob.objects.select_for_update().get(pk=job_id)
-        if attempt.part is not None or attempt.job.pk != job_id:
+        if attempt.job.pk != job_id:
             raise StaleExportUpdateError("wrong planning target")
         attempt._locked_record()
         _ensure_job_transition(job, ExportJob.Status.READY)
@@ -481,18 +457,13 @@ def complete_part(
         return part
 
 
-def split_part(
-    part_id: int, *, attempt: PlanningAttempt, children: Iterable[PartSpec], max_leaf_parts=None
-) -> list[ExportPart]:
+def split_part(part_id: int, *, children: Iterable[PartSpec], max_leaf_parts=None) -> list[ExportPart]:
     with transaction.atomic():
         part, plan, job = _get_locked_part(part_id)
         _ensure_current_part(part, plan, job)
         _ensure_running_job(job)
         if part.status != ExportPart.Status.FAILED:
             raise InvalidTransitionError("only a failed leaf may be split")
-        if attempt.part is None or attempt.record_id != part_id:
-            raise StaleExportUpdateError("wrong planning target")
-        attempt._locked_record()
         specs = _partition(children, start=part.start_time, end=part.end_time, tick=job.time_tick)
         if len(specs) < 2:
             raise PlanValidationError("splitting requires at least two children")
@@ -522,14 +493,43 @@ def split_part(
             lease_until=None,
             heartbeat_at=None,
             finished_at=_now(),
-            planning_lease_until=None,
-            next_planning_at=None,
+            next_retry_at=None,
         )
         ExportPart.objects.bulk_create(rows)
         _save(plan, part_count=count)
         # MySQL 的 bulk_create 不会回填自增主键，因此重新读取子分片，
         # 不能依赖内存中的实例。
         return list(ExportPart.objects.filter(plan=plan, parent=part).order_by("part_no"))
+
+
+def begin_split(part_id):
+    """认领一个待拆分的 OVERSIZED 叶子；next_retry_at 兼作进行中与退避标记。"""
+    with transaction.atomic():
+        part, plan, job = _get_locked_part(part_id)
+        _ensure_current_part(part, plan, job)
+        _ensure_running_job(job)
+        if part.status != ExportPart.Status.FAILED or part.error_code not in SPLITTABLE_PART_ERROR_CODES:
+            return None
+        now = _now()
+        if part.next_retry_at and part.next_retry_at > now:
+            return None
+        _save(part, next_retry_at=now + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_DEADLINE))
+        return part
+
+
+def fail_split(part_id, *, error_code, error_detail=""):
+    """拆分未完成，退避后等待下一轮扫描重试。"""
+    with transaction.atomic():
+        part, plan, job = _get_locked_part(part_id)
+        _ensure_current_part(part, plan, job)
+        if part.status != ExportPart.Status.FAILED:
+            return
+        _save(
+            part,
+            next_retry_at=_now() + timedelta(seconds=settings.ASYNC_EXPORT_PLANNING_RETRY_SECONDS),
+            error_code=error_code,
+            error_detail=error_detail,
+        )
 
 
 def finalize_job_success(job_id, *, plan_version, manifest_object_key, manifest_checksum, manifest_bytes=None):

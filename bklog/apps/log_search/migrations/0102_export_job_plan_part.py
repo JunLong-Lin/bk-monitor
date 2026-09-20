@@ -188,11 +188,6 @@ class Migration(migrations.Migration):
                 ("id", models.BigAutoField(primary_key=True, serialize=False)),
                 ("created_at", models.DateTimeField(auto_now_add=True, verbose_name="创建时间")),
                 ("updated_at", models.DateTimeField(auto_now=True, verbose_name="更新时间")),
-                ("planning_attempts", models.PositiveIntegerField(default=0)),
-                ("planning_generation", models.PositiveBigIntegerField(default=0)),
-                ("planning_started_at", models.DateTimeField(blank=True, null=True)),
-                ("planning_lease_until", models.DateTimeField(blank=True, null=True)),
-                ("next_planning_at", models.DateTimeField(blank=True, null=True)),
                 (
                     "part_no",
                     models.PositiveIntegerField(

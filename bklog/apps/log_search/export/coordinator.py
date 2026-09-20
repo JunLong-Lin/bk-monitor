@@ -44,11 +44,11 @@ class Limits:
 
 def dimensions(job, oversized):
     # 单索引下资源维度由索引集推导；联合/场景实现时再扩展完整资源集合。
-    resources = [f"index:{index_id}" for index_id in job.index_set_ids]
+    resources = sorted(set(job.index_set_ids))
     if not resources:
         raise BudgetUnavailable("index set ids are required")
     values = ["global", f"job:{job.pk}"]
-    values.extend(f"index:{hashlib.sha256(r.encode()).hexdigest()}" for r in sorted(set(resources)))
+    values.extend(f"index:{index_id}" for index_id in resources)
     if oversized:
         values.append("oversized")
     return values

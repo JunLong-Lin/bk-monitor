@@ -50,15 +50,21 @@ class AdaptivePlanner:
         self.heartbeat()
         return result
 
-    def fits(self, rows):
-        return rows <= self.policy.target_rows and rows * self.average_bytes <= self.policy.target_bytes
+    def should_split(self, rows):
+        """达到递归拆分触发值时细分时间范围。"""
+        return rows >= self.policy.split_rows or rows * self.average_bytes >= self.policy.split_bytes
+
+    def can_merge(self, rows):
+        """相邻小范围合计不超过合并上限时合并，减少过小 Part。"""
+        return rows <= self.policy.merge_rows and rows * self.average_bytes <= self.policy.merge_bytes
 
     def refine(self, start, end, rows):
         pending = [(start, end, rows)]
         while pending:
             start, end, rows = pending.pop()
-            if self.fits(rows) or end - start == self.tick:
-                yield PartSpec(None, start, end, rows, rows * self.average_bytes, not self.fits(rows))
+            oversized = self.should_split(rows)
+            if not oversized or end - start == self.tick:
+                yield PartSpec(None, start, end, rows, rows * self.average_bytes, oversized)
                 continue
             midpoint = start + ((end - start) // self.tick // 2) * self.tick
             left = nonnegative_integer(self.call(self.statistics.count, start, midpoint))
@@ -118,7 +124,7 @@ class AdaptivePlanner:
                     previous
                     and not previous.oversized
                     and not part.oversized
-                    and self.fits(previous.estimated_rows + part.estimated_rows)
+                    and self.can_merge(previous.estimated_rows + part.estimated_rows)
                 ):
                     parts[-1] = replace(
                         previous,

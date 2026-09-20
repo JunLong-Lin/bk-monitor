@@ -53,6 +53,9 @@ class PartSpec:
 class PlannerPolicy:
     target_rows: int = 30_000
     target_bytes: int = 64 * 1024 * 1024
+    # 递归拆分触发 = split_factor × 软目标；相邻合并上限 = merge_factor × 软目标。
+    split_factor: float = 2.0
+    merge_factor: float = 1.5
     max_rows: int = 10_000_000
     max_parts: int = 500
     sample_rows: int = 100
@@ -64,8 +67,28 @@ class PlannerPolicy:
     request_timeout: int = 15
 
     def __post_init__(self):
-        if any(type(value) is not int or value < 1 for value in vars(self).values()):
-            raise PlanningError("INVALID_PLANNER_POLICY")
+        for name, value in vars(self).items():
+            if name in {"split_factor", "merge_factor"}:
+                if type(value) not in (int, float) or value < 1:
+                    raise PlanningError("INVALID_PLANNER_POLICY")
+            elif type(value) is not int or value < 1:
+                raise PlanningError("INVALID_PLANNER_POLICY")
+
+    @property
+    def split_rows(self) -> int:
+        return int(self.target_rows * self.split_factor)
+
+    @property
+    def split_bytes(self) -> int:
+        return int(self.target_bytes * self.split_factor)
+
+    @property
+    def merge_rows(self) -> int:
+        return int(self.target_rows * self.merge_factor)
+
+    @property
+    def merge_bytes(self) -> int:
+        return int(self.target_bytes * self.merge_factor)
 
     @classmethod
     def configured(cls):

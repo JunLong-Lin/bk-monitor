@@ -46,7 +46,8 @@ class AdaptivePlannerTest(TestCase):
 
     def test_uniform_load_and_byte_budget(self):
         parts, _, _ = self.build(dict.fromkeys(range(60), 100), target_rows=100_000, target_bytes=10_000)
-        self.assertTrue(all(p.estimated_bytes <= 10_000 for p in parts))
+        # 字节维度触发递归拆分：每片估算字节不超过递归触发值（2x 软目标）。
+        self.assertTrue(all(p.estimated_bytes <= 20_000 for p in parts))
         self.assertGreater(len(parts), 1)
 
     def test_minimum_tick_hotspot_is_oversized_and_not_merged(self):
